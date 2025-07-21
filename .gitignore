@@ -1,4 +1,6 @@
 *.gb
 .vscode
-.zig*
+.zig
 zig-out/*
+*.zip
+.zig-cache/
