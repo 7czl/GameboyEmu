@@ -6,7 +6,6 @@ pub const RomHeader = packed struct {
     entry_point: @Vector(4, u8), // 0x100-0103
     nintendo_logo: @Vector(48, u8), // 0x104-0x133
     title: @Vector(16, u8), // 0x134-0x143
-    // manufacturer_code: @Vector(4, u8), //0x13F-0x142
     new_licensee_code: @Vector(2, u8), //0x144-0x145
     sgb_flag: u8, //0x146
     cartridge_type: u8, //0x147
