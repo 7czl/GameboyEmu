@@ -111,6 +111,30 @@ pub const CPU = struct {
                 self.pc += 3;
                 return 20;
             },
+            0x0C => { // INC C
+                const original_c = self.c;
+                const c_flag_preserved = self.f & C_FLAG;
+                self.c +%= 1;
+                self.f = 0;
+                self.set_zero_flag(self.c == 0);
+                self.set_substract_flag(false);
+                self.set_half_carry_flag((original_c & 0x0F) == 0x0F);
+                self.f |= c_flag_preserved;
+                self.pc += 1;
+                return 4;
+            },
+            0x0D => { // DEC C
+                const original_c = self.c;
+                const c_flag_preserved = self.f & C_FLAG;
+                self.c -%= 1;
+                self.f = 0;
+                self.set_zero_flag(self.c == 0);
+                self.set_half_carry_flag((original_c & 0x0F) == 0x00);
+                self.set_substract_flag(true);
+                self.f |= c_flag_preserved;
+                self.pc += 1;
+                return 4;
+            },
             0x0E => { // LD C, u8
                 const v = bus.read(self.pc + 1);
                 self.c = v;
@@ -126,12 +150,42 @@ pub const CPU = struct {
                 self.pc += 3;
                 return 12;
             },
+            0x12 => { // LD (DE),A
+                const addr = self.get_de();
+                bus.write(addr, self.a);
+                self.pc += 1;
+                return 8;
+            },
             0x13 => { // INC DE
                 var de = self.get_de();
                 de +%= 1;
                 self.set_de(de);
                 self.pc += 1;
                 return 8;
+            },
+            0x14 => { // INC D
+                const original_d = self.d;
+                const c_flag_preserved = self.f & C_FLAG;
+                self.d +%= 1;
+                self.f = 0;
+                self.set_zero_flag(self.d == 0);
+                self.set_substract_flag(false);
+                self.set_half_carry_flag((original_d & 0x0F) == 0x0F);
+                self.f |= c_flag_preserved;
+                self.pc += 1;
+                return 4;
+            },
+            0x15 => {
+                const original_d = self.d;
+                const c_flag_preserved = self.f & C_FLAG;
+                self.d -%= 1;
+                self.f = 0;
+                self.set_zero_flag(self.d == 0);
+                self.set_half_carry_flag((original_d & 0x0F) == 0x00);
+                self.set_substract_flag(true);
+                self.f |= c_flag_preserved;
+                self.pc += 1;
+                return 4;
             },
             0x16 => { // LD D, u8
                 const v = bus.read(self.pc + 1);
@@ -357,6 +411,13 @@ pub const CPU = struct {
                 self.l = v;
                 self.pc += 2;
                 return 8;
+            },
+            0x2F => { //CP L
+                self.a = ~self.a;
+                self.set_substract_flag(true);
+                self.set_carry_flag(true);
+                self.pc += 1;
+                return 4;
             },
             0x30 => { // JR NC, i8
                 // 相对PC跳转，carry 是0 则跳转
@@ -799,6 +860,32 @@ pub const CPU = struct {
                 self.pc += 1;
                 return 4;
             },
+            0x81 => { // ADD A, C
+                const orignal_a = self.a;
+                const val = self.c;
+                const res: u16 = @as(u16, orignal_a) + @as(u16, val);
+                self.a = @truncate(res);
+                self.f = 0;
+                self.set_zero_flag(self.a == 0);
+                self.set_substract_flag(false);
+                self.set_carry_flag(res > 0xFF);
+                self.set_half_carry_flag((orignal_a & 0x0F) + (val & 0x0F) > 0x0F);
+                self.pc += 1;
+                return 4;
+            },
+
+            0x91 => { // SUB A, C
+                const original_a = self.a;
+                self.a -%= self.c;
+
+                self.f = 0;
+                self.set_zero_flag(self.a == 0);
+                self.set_carry_flag(original_a < self.c);
+                self.set_substract_flag(true);
+                self.set_half_carry_flag((original_a & 0x0F) < (self.c & 0x0F));
+                self.pc += 1;
+                return 4;
+            },
             0xAF => { // XOR A, A
                 self.a = 0x0;
                 self.f = 0;
@@ -830,6 +917,15 @@ pub const CPU = struct {
                 self.pc += 1;
                 return 8;
             },
+            0xBB => { //CP A,E
+                self.f = 0;
+                self.set_substract_flag(true);
+                self.set_zero_flag(self.a == self.e);
+                self.set_half_carry_flag((self.a & 0x0F) < (self.e & 0x0F));
+                self.set_carry_flag(self.a < self.e);
+                self.pc += 1;
+                return 4;
+            },
             0xBE => { // CP A,(HL)
                 const addr = self.get_hl();
                 const val = bus.read(addr);
@@ -851,6 +947,17 @@ pub const CPU = struct {
                 self.set_carry_flag(false);
                 self.pc += 1;
                 return 4;
+            },
+            0xF8 => {
+                const offset: i8 = @bitCast(bus.read(self.pc + 1));
+                const sp = self.sp;
+                const res = @as(u16, @bitCast(@as(i16, @bitCast(sp)) + offset));
+                self.set_hl(res);
+                self.f = 0;
+                self.set_half_carry_flag(((sp & 0x0F) + (@as(u8, @bitCast(offset)) & 0x0F)) > 0x0F);
+                self.set_carry_flag(((sp & 0xFF) + (@as(u8, @bitCast(offset)) & 0xFF)) > 0xFF);
+                self.pc += 2;
+                return 12;
             },
             0xFE => { // CP A, u8
                 const imm_v = bus.read(self.pc + 1);
