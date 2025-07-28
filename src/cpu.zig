@@ -870,6 +870,19 @@ pub const CPU = struct {
                 self.pc += 1;
                 return 12;
             },
+            0xC2 => { // JP NZ, u16
+                const low = bus.read(self.pc + 1);
+                const high = bus.read(self.pc + 2);
+
+                if (!self.get_zero_flag()) {
+                    const addr = (@as(u16, high) << 8) | @as(u16, low);
+                    self.pc = addr;
+                    return 16;
+                } else {
+                    self.pc += 3;
+                    return 12;
+                }
+            },
             0xC3 => { // JP u16
                 const lo = bus.read(self.pc + 1);
                 const hi = bus.read(self.pc + 2);
@@ -1182,6 +1195,14 @@ pub const CPU = struct {
                 bus.write(self.sp, self.f);
                 self.pc += 1;
                 return 16;
+            },
+            0xF6 => { // OR A, u8
+                const val = bus.read(self.pc + 1);
+                self.a |= val;
+                self.f = 0;
+                self.set_zero_flag(self.a == 0);
+                self.pc += 2;
+                return 8;
             },
             0xFA => { // LD A, (nn)
                 const lsb = bus.read(self.pc + 1);
