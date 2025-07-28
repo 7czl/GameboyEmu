@@ -2,7 +2,8 @@ const std = @import("std");
 const Romheader = @import("header.zig").RomHeader;
 const Bus = @import("bus.zig").Bus;
 const Cpu = @import("cpu.zig").CPU;
-
+const Timer = @import("timer.zig").Timer;
+const Ppu = @import("ppu.zig").Ppu;
 const posix = std.posix;
 
 pub fn main() !void {
@@ -25,11 +26,16 @@ pub fn main() !void {
     const rom_bytes = std.mem.sliceAsBytes(map_ptr);
 
     defer posix.munmap(rom_bytes);
-    var bus = Bus.init(rom_bytes);
+    var ppu = Ppu.init();
+    var timer = Timer.init();
+    var bus = Bus.init(rom_bytes, &timer, &ppu);
+
     var cpu = Cpu.init();
     std.log.info("--- start emulation loop ---", .{});
     while (true) {
-        _ = cpu.step(&bus);
+        const cycles = cpu.step(&bus);
+        timer.step(&bus, @intCast(cycles));
+        ppu.step(&bus, @intCast(cycles));
         if (cpu.pc == 0x005B) {
             std.log.debug("PC reached debug point. Halting", .{});
         }
