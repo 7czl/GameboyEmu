@@ -1,9 +1,10 @@
+const std = @import("std");
 const Bus = @import("bus.zig").Bus;
 
 pub const Timer = struct {
     div_counter: u16 = 0,
     tima_counter: u16 = 0,
-    div: u8 = 0,
+    // div: u8 = 0,
     tima: u8 = 0,
     tma: u8 = 0,
     tac: u8 = 0,
@@ -11,11 +12,7 @@ pub const Timer = struct {
         return Timer{};
     }
     pub fn step(self: *Timer, bus: *Bus, cycles: u8) void {
-        self.div_counter +%= cycles;
-        if (self.div_counter >= 256) {
-            self.div_counter -= 256;
-            self.div +%= 1;
-        }
+        self.div_counter +%= @as(u16, cycles);
         if (self.tac & 0b100 != 0) {
             self.tima_counter +%= cycles;
             const freq_cycles: u16 = switch (self.tac & 0b11) {

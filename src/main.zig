@@ -30,17 +30,82 @@ pub fn main() !void {
     var timer = Timer.init();
     var bus = Bus.init(rom_bytes, &timer, &ppu);
 
+    // debug
+    var instruction_count: u64 = 0;
+    // var last_pc: u16 = 0;
+    // var same_pc_count: u32 = 0;
+    // var pc_frequencies = std.HashMap(u16, u32, std.hash_map.AutoContext(u16), 80).init(allocator);
+    // defer pc_frequencies.deinit();
+
     var cpu = Cpu.init();
     std.log.info("--- start emulation loop ---", .{});
     while (true) {
+        // const current_pc = cpu.pc;
+        instruction_count += 1;
+        // const result = try pc_frequencies.getOrPut(current_pc);
+        // if (!result.found_existing) {
+        //     result.value_ptr.* = 0;
+        // }
+        // result.value_ptr.* += 1;
+
+        // if (current_pc == last_pc) {
+        //     same_pc_count += 1;
+        //     if (same_pc_count > 5000) {
+        //         std.log.err("=== STUCK IN SINGLE INSTRUCTION ===", .{});
+        //         std.log.err("PC: 0x{X:0>4} executed {d} times in a row", .{ current_pc, same_pc_count });
+        //         const opcode = bus.read(current_pc);
+        //         std.log.err("Opcode: 0x{X:0>2}", .{opcode});
+        //         break;
+        //     }
+        // } else {
+        //     same_pc_count = 0;
+        // }
+        // if (instruction_count % 1000 == 0) {
+        //     std.log.info("Instructions: {d}, PC: 0x{X:0>4}", .{ instruction_count, current_pc });
+
+        //     // 找出最频繁执行的PC地址
+        //     var max_frequency: u32 = 0;
+        //     var most_frequent_pc: u16 = 0;
+        //     var iterator = pc_frequencies.iterator();
+        //     while (iterator.next()) |entry| {
+        //         if (entry.value_ptr.* > max_frequency) {
+        //             max_frequency = entry.value_ptr.*;
+        //             most_frequent_pc = entry.key_ptr.*;
+        //         }
+        //     }
+
+        //     if (max_frequency > 100) {
+        //         std.log.warn("Hotspot detected: PC 0x{X:0>4} executed {d} times", .{ most_frequent_pc, max_frequency });
+        //     }
+        // }
+        if (instruction_count > 1000000000) { // 1 billion
+            // std.log.err("=== EXECUTION LIMIT REACHED ===", .{});
+            // std.log.err("Total instructions: {d}", .{instruction_count});
+
+            // // 打印最频繁的PC地址
+            // std.log.err("Top hotspots:", .{});
+            // var iterator = pc_frequencies.iterator();
+            // var hotspots: [10]struct { pc: u16, count: u32 } = undefined;
+            // var hotspot_count: usize = 0;
+
+            // while (iterator.next()) |entry| {
+            //     if (entry.value_ptr.* > 50 and hotspot_count < 10) {
+            //         hotspots[hotspot_count] = .{ .pc = entry.key_ptr.*, .count = entry.value_ptr.* };
+            //         hotspot_count += 1;
+            //     }
+            // }
+            // for (0..hotspot_count) |i| {
+            //     const opcode = bus.read(hotspots[i].pc);
+            //     std.log.err("  PC 0x{X:0>4}: {d} times (opcode: 0x{X:0>2})", .{ hotspots[i].pc, hotspots[i].count, opcode });
+            // }
+            break;
+        }
+
         const cycles = cpu.step(&bus);
         timer.step(&bus, @intCast(cycles));
         ppu.step(&bus, @intCast(cycles));
-        if (cpu.pc == 0x005B) {
-            std.log.debug("PC reached debug point. Halting", .{});
-        }
+        // last_pc = current_pc;
     }
 
-    // const header: *const Romheader = @ptrCast(&rom_bytes[0x100]);
     return;
 }
