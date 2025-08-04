@@ -1755,6 +1755,19 @@ pub const CPU = struct {
                 self.pc += 1;
                 return 4;
             },
+            0xC0 => { // RET NZ
+                if (!self.get_zero_flag()) {
+                    const low = bus.read(self.sp);
+                    self.sp +%= 1;
+                    const high = bus.read(self.sp);
+                    self.sp +%= 1;
+                    self.pc = (@as(u16, high) << 8) | @as(u16, low);
+                    return 20;
+                } else {
+                    self.pc += 1;
+                    return 8;
+                }
+            },
             0xC1 => { // POP BC
                 self.c = bus.read(self.sp);
                 self.sp +%= 1;
@@ -1866,6 +1879,54 @@ pub const CPU = struct {
                 const cb_opcode = bus.read(self.pc + 1);
                 self.pc += 2;
                 switch (cb_opcode) {
+                    0x00 => { // RLC B
+                        const original_b = self.b;
+                        const carry = (self.f & C_FLAG) != 0;
+                        self.f = 0;
+                        self.set_carry_flag((original_b & 0x80) != 0);
+                        self.b = (original_b << 1) | @as(u8, @intFromBool(carry));
+                        self.set_zero_flag(self.b == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(false);
+                        return 8;
+                    },
+                    0x01 => { // RLC C
+                        const original_c = self.c;
+                        const carry = (self.f & C_FLAG) != 0;
+                        self.f = 0;
+                        self.set_carry_flag((original_c & 0x80) != 0);
+                        self.c = (original_c << 1) | @as(u8, @intFromBool(carry));
+                        self.set_zero_flag(self.c == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(false);
+                        return 8;
+                    },
+                    0x02 => { // RLC D
+                        const original_d = self.d;
+                        const carry = (self.f & C_FLAG) != 0;
+                        self.f = 0;
+                        self.set_carry_flag((original_d & 0x80) != 0);
+                        self.d = (original_d << 1) | @as(u8, @intFromBool(carry));
+                        self.set_zero_flag(self.d == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(false);
+                        return 8;
+                    },
+                    0x12 => { // RL D
+                        const original_d = self.d;
+                        const carry = (self.f & C_FLAG) != 0;
+                        self.f = 0;
+                        self.set_carry_flag((original_d & 0x80) != 0);
+                        self.d = (original_d << 1) | @as(u8, @intFromBool(carry));
+                        self.set_zero_flag(self.d == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(false);
+                        return 8;
+                    },
+                    0xC0 => { // SET 0, B
+                        self.b |= 0x01;
+                        return 8;
+                    },
                     0x1B => { // RR E
                         const orignal_e = self.e;
                         const carry = (self.f & C_FLAG) != 0;
@@ -1993,6 +2054,17 @@ pub const CPU = struct {
                 self.pc += 2;
                 return 8;
             },
+            0xCF => { // RST 08h
+                const ret_addr = self.pc + 1;
+                const pc_hi: u8 = @truncate(ret_addr >> 8);
+                const pc_lo: u8 = @truncate(ret_addr);
+                self.sp -%= 1;
+                bus.write(self.sp, pc_hi);
+                self.sp -%= 1;
+                bus.write(self.sp, pc_lo);
+                self.pc = 0x0008;
+                return 16;
+            },
             0xD0 => { // RET NC
                 if ((self.f & C_FLAG) == 0) {
                     const low = bus.read(self.sp);
@@ -2016,6 +2088,39 @@ pub const CPU = struct {
                 self.pc += 1;
                 return 12;
             },
+            0xD2 => { // JP NC, u16
+                const low = bus.read(self.pc + 1);
+                const high = bus.read(self.pc + 2);
+
+                if ((self.f & C_FLAG) == 0) {
+                    const addr = (@as(u16, high) << 8) | @as(u16, low);
+                    self.pc = addr;
+                    return 16;
+                } else {
+                    self.pc += 3;
+                    return 12;
+                }
+            },
+            0xD3 => {
+                std.log.err("FATAL: Unimplemented opcode 0xD3 at PC=0x{x:0>4}", .{self.pc});
+                unreachable;
+            },
+            0xD4 => { // CALL NC, u16
+                const low = bus.read(self.pc + 1);
+                const high = bus.read(self.pc + 2);
+                if ((self.f & C_FLAG) == 0) {
+                    const ret_addr = self.pc + 3;
+                    self.sp -%= 1;
+                    bus.write(self.sp, @truncate(ret_addr >> 8));
+                    self.sp -%= 1;
+                    bus.write(self.sp, @truncate(ret_addr));
+                    self.pc = (@as(u16, high) << 8) | @as(u16, low);
+                    return 24;
+                } else {
+                    self.pc += 3;
+                    return 12;
+                }
+            },
             0xD5 => { // PUSH DE
                 self.sp -%= 1;
                 bus.write(self.sp, self.d);
@@ -2036,6 +2141,17 @@ pub const CPU = struct {
                 self.pc += 2;
                 return 8;
             },
+            0xD7 => { // RST 10h
+                const ret_addr = self.pc + 1;
+                const pc_hi: u8 = @truncate(ret_addr >> 8);
+                const pc_lo: u8 = @truncate(ret_addr);
+                self.sp -%= 1;
+                bus.write(self.sp, pc_hi);
+                self.sp -%= 1;
+                bus.write(self.sp, pc_lo);
+                self.pc = 0x0010;
+                return 16;
+            },
             0xD8 => { //RET C
                 if ((self.f & C_FLAG) != 0) {
                     const lo = bus.read(self.sp);
@@ -2047,6 +2163,44 @@ pub const CPU = struct {
                 } else {
                     self.pc += 1;
                     return 8;
+                }
+            },
+            0xD9 => { // RETI
+                const low = bus.read(self.sp);
+                self.sp +%= 1;
+                const high = bus.read(self.sp);
+                self.sp +%= 1;
+                self.pc = (@as(u16, high) << 8) | @as(u16, low);
+                self.interrupt_master_enable = true; // Enable interrupts after RETI
+                return 16;
+            },
+            0xDA => { // JP C, u16
+                const low = bus.read(self.pc + 1);
+                const high = bus.read(self.pc + 2);
+
+                if ((self.f & C_FLAG) != 0) {
+                    const addr = (@as(u16, high) << 8) | @as(u16, low);
+                    self.pc = addr;
+                    return 16;
+                } else {
+                    self.pc += 3;
+                    return 12;
+                }
+            },
+            0xDC => { // CALL C, u16
+                const low = bus.read(self.pc + 1);
+                const high = bus.read(self.pc + 2);
+                if ((self.f & C_FLAG) != 0) {
+                    const ret_addr = self.pc + 3;
+                    self.sp -%= 1;
+                    bus.write(self.sp, @truncate(ret_addr >> 8));
+                    self.sp -%= 1;
+                    bus.write(self.sp, @truncate(ret_addr));
+                    self.pc = (@as(u16, high) << 8) | @as(u16, low);
+                    return 24;
+                } else {
+                    self.pc += 3;
+                    return 12;
                 }
             },
             0xDE => { //SBC A,u8
@@ -2062,6 +2216,17 @@ pub const CPU = struct {
                 self.set_carry_flag(@as(u16, a) < @as(u16, val) + @as(u16, carry));
                 self.pc += 2;
                 return 8;
+            },
+            0xDF => { // RST 18h
+                const ret_addr = self.pc + 1;
+                const pc_hi: u8 = @truncate(ret_addr >> 8);
+                const pc_lo: u8 = @truncate(ret_addr);
+                self.sp -%= 1;
+                bus.write(self.sp, pc_hi);
+                self.sp -%= 1;
+                bus.write(self.sp, pc_lo);
+                self.pc = 0x0018;
+                return 16;
             },
             0xE0 => { // LD (FF00+U8), A
                 const offset = bus.read(self.pc + 1);
@@ -2104,6 +2269,17 @@ pub const CPU = struct {
                 self.set_carry_flag(false);
                 self.pc += 2;
                 return 8;
+            },
+            0xE7 => { // RST 20h
+                const ret_addr = self.pc + 1;
+                const pc_hi: u8 = @truncate(ret_addr >> 8);
+                const pc_lo: u8 = @truncate(ret_addr);
+                self.sp -%= 1;
+                bus.write(self.sp, pc_hi);
+                self.sp -%= 1;
+                bus.write(self.sp, pc_lo);
+                self.pc = 0x0020;
+                return 16;
             },
             0xE8 => { // ADD SP, i8
                 const imm_u8 = bus.read(self.pc + 1);
@@ -2180,6 +2356,12 @@ pub const CPU = struct {
                 self.pc += 1;
                 return 12;
             },
+            0xF2 => { // LD A, (FF00 + C)
+                const addr = 0xFF00 + @as(u16, self.c);
+                self.a = bus.read(addr);
+                self.pc += 1;
+                return 8;
+            },
             0xF3 => { // DI
                 self.interrupt_master_enable = false;
                 self.ime_scheduled = false;
@@ -2246,7 +2428,6 @@ pub const CPU = struct {
                 self.pc += 1;
                 return 4;
             },
-
             0xFE => { // CP A, u8
                 const imm_v = bus.read(self.pc + 1);
                 self.f = 0;
@@ -2256,6 +2437,17 @@ pub const CPU = struct {
                 self.set_carry_flag(self.a < imm_v);
                 self.pc += 2;
                 return 8;
+            },
+            0xFF => { // RST 38h
+                const ret_addr = self.pc + 1;
+                const pc_hi: u8 = @truncate(ret_addr >> 8);
+                const pc_lo: u8 = @truncate(ret_addr);
+                self.sp -%= 1;
+                bus.write(self.sp, pc_hi);
+                self.sp -%= 1;
+                bus.write(self.sp, pc_lo);
+                self.pc = 0x0038;
+                return 16;
             },
             else => |op| {
                 std.log.err("FATAL: Unimplemented opcode 0x{X:0>2} at PC=0x{X:0>4}", .{ op, self.pc });
