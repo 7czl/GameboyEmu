@@ -15,6 +15,7 @@ pub const CPU = struct {
     interrupt_master_enable: bool = false,
     halted: bool = false,
     ime_scheduled: bool = false,
+    halt_bug_active: bool = false,
 
     const Z_FLAG: u8 = 1 << 7; // 0b10000000
     const N_FLAG: u8 = 1 << 6; // 0b01000000
@@ -35,16 +36,47 @@ pub const CPU = struct {
         };
     }
     pub fn step(self: *CPU, bus: *Bus) u8 {
+        std.log.debug("CPU Step: PC=0x{X:0>4}, SP=0x{X:0>4}, A={X:0>2} F={X:0>2} B={X:0>2} C={X:0>2} D={X:0>2} E={X:0>2} H={X:0>2} L={X:0>2}, IME={}, Haltd={}, HaltBug={}", .{ self.pc, self.sp, self.a, self.f, self.b, self.c, self.d, self.e, self.h, self.l, self.interrupt_master_enable, self.halted, self.halt_bug_active });
+
+        // Handle scheduled IME enable (EI instruction)
         if (self.ime_scheduled) {
             self.interrupt_master_enable = true;
             self.ime_scheduled = false;
+            std.log.debug("CPU: IME enabled (scheduled)", .{});
         }
-        if (self.halted and (bus.interrupt_flag & bus.read(0xFFFF) != 0)) {
-            self.halted = false;
-            std.log.debug("Exiting HALT due to IF=0x{x:0>2} & IE=0x{x:0>2}", .{ bus.interrupt_flag, bus.read(0xFFFF) });
+
+        // --- Interrupt Handling (before instruction fetch/execution) ---
+        // This is crucial for correct interrupt timing and HALT behavior.
+        const interrupt_enable_reg = bus.read(0xFFFF);
+        const pending_interrupts = bus.interrupt_flag & interrupt_enable_reg;
+
+        // If CPU is halted and an interrupt is pending, exit HALT
+        if (self.halted) {
+            if (pending_interrupts != 0) {
+                self.halted = false;
+                std.log.debug("CPU: Exiting HALT due to pending interrupt. IF=0x{X:0>2}, IE=0x{X:0>2}", .{ bus.interrupt_flag, interrupt_enable_reg });
+                if (self.halt_bug_active) {
+                    self.pc += 1; // Skip the instruction that would have been executed after HALT
+                    self.halt_bug_active = false; // Reset the flag
+                    std.log.debug("CPU: HALT bug triggered, PC advanced to 0x{X:0>4} (skipping next instruction)", .{self.pc});
+                }
+            } else {
+                // Still halted, no interrupt to wake up
+                std.log.debug("CPU: Still Halted at PC=0x{X:0>4}, IF=0x{X:0>2}, IE=0x{X:0>2}", .{ self.pc, bus.interrupt_flag, interrupt_enable_reg });
+                return 4; // Consume cycles for being halted
+            }
         }
+
+        // If IME is enabled and there are pending *and enabled* interrupts, handle them now.
+        if (self.interrupt_master_enable and pending_interrupts != 0) {
+            self.handle_interrupts(bus); // This will push PC and jump to vector
+            return 20; // Cycles for interrupt handling (RST + push/pop)
+        }
+
+        // --- Normal Instruction Fetch & Execution ---
         const cycles = self.execute_instruction(bus);
-        self.handle_interrupts(bus);
+
+        std.log.debug("CPU Step End: Cycles={d}", .{cycles});
         return cycles;
     }
     fn execute_instruction(self: *CPU, bus: *Bus) u8 {
@@ -950,9 +982,11 @@ pub const CPU = struct {
             },
             0x76 => { //HALT
                 const interrupt_enable = bus.read(0xFFFF);
-                if (!self.interrupt_master_enable and (interrupt_enable & bus.interrupt_flag) != 0) {} else {
-                    self.halted = true;
+                if (!self.interrupt_master_enable and (interrupt_enable & bus.interrupt_flag) != 0) {
+                    // IME 是0 但是有中断请求 则进入 HALT BUG 状态
+                    self.halt_bug_active = true;
                 }
+                self.halted = true;
                 self.pc += 1;
                 std.log.debug("HALT at PC=0x{x:0>4}, IF=0x{x:0>2}, IE=0x{x:0>2}", .{ self.pc, bus.interrupt_flag, bus.read(0xFFFF) });
                 return 4;
@@ -1881,10 +1915,9 @@ pub const CPU = struct {
                 switch (cb_opcode) {
                     0x00 => { // RLC B
                         const original_b = self.b;
-                        const carry = (self.f & C_FLAG) != 0;
                         self.f = 0;
                         self.set_carry_flag((original_b & 0x80) != 0);
-                        self.b = (original_b << 1) | @as(u8, @intFromBool(carry));
+                        self.b = (original_b << 1) | @as(u8, @intFromBool(self.get_carry_flag()));
                         self.set_zero_flag(self.b == 0);
                         self.set_substract_flag(false);
                         self.set_half_carry_flag(false);
@@ -1892,10 +1925,9 @@ pub const CPU = struct {
                     },
                     0x01 => { // RLC C
                         const original_c = self.c;
-                        const carry = (self.f & C_FLAG) != 0;
                         self.f = 0;
                         self.set_carry_flag((original_c & 0x80) != 0);
-                        self.c = (original_c << 1) | @as(u8, @intFromBool(carry));
+                        self.c = (original_c << 1) | @as(u8, @intFromBool(self.get_carry_flag()));
                         self.set_zero_flag(self.c == 0);
                         self.set_substract_flag(false);
                         self.set_half_carry_flag(false);
@@ -1903,61 +1935,573 @@ pub const CPU = struct {
                     },
                     0x02 => { // RLC D
                         const original_d = self.d;
-                        const carry = (self.f & C_FLAG) != 0;
                         self.f = 0;
                         self.set_carry_flag((original_d & 0x80) != 0);
-                        self.d = (original_d << 1) | @as(u8, @intFromBool(carry));
+                        self.d = (original_d << 1) | @as(u8, @intFromBool(self.get_carry_flag()));
                         self.set_zero_flag(self.d == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(false);
+                        return 8;
+                    },
+                    0x03 => { //RLC E
+                        const original_e = self.e;
+                        self.f = 0;
+                        self.set_carry_flag((original_e & 0x80) != 0);
+                        self.e = (original_e << 1) | @as(u8, @intFromBool(self.get_carry_flag()));
+                        self.set_zero_flag(self.e == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(false);
+                        return 8;
+                    },
+                    0x04 => { // RLC H
+                        const original_h = self.h;
+                        self.f = 0;
+                        self.set_carry_flag((original_h & 0x80) != 0);
+                        self.h = (original_h << 1) | @as(u8, @intFromBool(self.get_carry_flag()));
+                        self.set_zero_flag(self.h == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(false);
+                        return 8;
+                    },
+                    0x05 => { // RLC L
+                        const original_l = self.l;
+                        self.f = 0;
+                        self.set_carry_flag((original_l & 0x80) != 0);
+                        self.l = (original_l << 1) | @as(u8, @intFromBool(self.get_carry_flag()));
+                        self.set_zero_flag(self.l == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(false);
+                        return 8;
+                    },
+                    0x06 => { // RLC (HL)
+                        const addr = self.get_hl();
+                        const original_value = bus.read(addr);
+                        self.f = 0;
+                        self.set_carry_flag((original_value & 0x80) != 0);
+                        const new_value = (original_value << 1) | @as(u8, @intFromBool(self.get_carry_flag()));
+                        bus.write(addr, new_value);
+                        self.set_zero_flag(new_value == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(false);
+                        return 16;
+                    },
+                    0x07 => { // RLC A
+                        const original_a = self.a;
+                        self.f = 0;
+                        self.set_carry_flag((original_a & 0x80) != 0);
+                        self.a = (original_a << 1) | @as(u8, @intFromBool(self.get_carry_flag()));
+                        self.set_zero_flag(self.a == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(false);
+                        return 8;
+                    },
+                    0x08 => { // RRC B
+                        const original_b = self.b;
+                        self.f = 0;
+                        self.set_carry_flag((original_b & 0x01) != 0);
+                        self.b = (original_b >> 1) | @as(u8, @intFromBool(self.get_carry_flag())) << 7;
+                        self.set_zero_flag(self.b == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(false);
+                        return 8;
+                    },
+                    0x09 => { // RRC C
+                        const original_c = self.c;
+                        self.f = 0;
+                        self.set_carry_flag((original_c & 0x01) != 0);
+                        self.c = (original_c >> 1) | @as(u8, @intFromBool(self.get_carry_flag())) << 7;
+                        self.set_zero_flag(self.c == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(false);
+                        return 8;
+                    },
+                    0x0A => { // RRC D
+                        const original_d = self.d;
+                        self.f = 0;
+                        self.set_carry_flag((original_d & 0x01) != 0);
+                        self.d = (original_d >> 1) | @as(u8, @intFromBool(self.get_carry_flag())) << 7;
+                        self.set_zero_flag(self.d == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(false);
+                        return 8;
+                    },
+                    0x0B => { // RRC E
+                        const original_e = self.e;
+                        self.f = 0;
+                        self.set_carry_flag((original_e & 0x01) != 0);
+                        self.e = (original_e >> 1) | @as(u8, @intFromBool(self.get_carry_flag())) << 7;
+                        self.set_zero_flag(self.e == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(false);
+                        return 8;
+                    },
+                    0x0C => { // RRC H
+                        const original_h = self.h;
+                        self.f = 0;
+                        self.set_carry_flag((original_h & 0x01) != 0);
+                        self.h = (original_h >> 1) | @as(u8, @intFromBool(self.get_carry_flag())) << 7;
+                        self.set_zero_flag(self.h == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(false);
+                        return 8;
+                    },
+                    0x0D => { // RRC L
+                        const original_l = self.l;
+                        self.f = 0;
+                        self.set_carry_flag((original_l & 0x01) != 0);
+                        self.l = (original_l >> 1) | @as(u8, @intFromBool(self.get_carry_flag())) << 7;
+                        self.set_zero_flag(self.l == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(false);
+                        return 8;
+                    },
+                    0x0E => { // RRC (HL)
+                        const addr = self.get_hl();
+                        const original_value = bus.read(addr);
+                        self.f = 0;
+                        self.set_carry_flag((original_value & 0x01) != 0);
+                        const new_value = (original_value >> 1) | @as(u8, @intFromBool(self.get_carry_flag())) << 7;
+                        bus.write(addr, new_value);
+                        self.set_zero_flag(new_value == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(false);
+                        return 16;
+                    },
+                    0x0F => { // RRC A
+                        const original_a = self.a;
+                        self.f = 0;
+                        self.set_carry_flag((original_a & 0x01) != 0);
+                        self.a = (original_a >> 1) | @as(u8, @intFromBool(self.get_carry_flag())) << 7;
+                        self.set_zero_flag(self.a == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(false);
+                        return 8;
+                    },
+                    0x10 => { // RL B
+                        const original_b = self.b;
+                        const carry_in: u8 = if (self.get_carry_flag()) 1 else 0;
+                        self.f = 0;
+                        self.set_carry_flag((original_b & 0x80) != 0);
+                        self.b = (original_b << 1) | carry_in;
+                        self.set_zero_flag(self.b == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(false);
+                        return 8;
+                    },
+                    0x11 => { // RL C
+                        const original_c = self.c;
+                        const carry_in: u8 = if (self.get_carry_flag()) 1 else 0;
+                        self.f = 0;
+                        self.set_carry_flag((original_c & 0x80) != 0);
+                        self.c = (original_c << 1) | carry_in;
+                        self.set_zero_flag(self.c == 0);
                         self.set_substract_flag(false);
                         self.set_half_carry_flag(false);
                         return 8;
                     },
                     0x12 => { // RL D
                         const original_d = self.d;
-                        const carry = (self.f & C_FLAG) != 0;
+                        const carry_in: u8 = if (self.get_carry_flag()) 1 else 0;
                         self.f = 0;
                         self.set_carry_flag((original_d & 0x80) != 0);
-                        self.d = (original_d << 1) | @as(u8, @intFromBool(carry));
+                        self.d = (original_d << 1) | carry_in;
                         self.set_zero_flag(self.d == 0);
                         self.set_substract_flag(false);
                         self.set_half_carry_flag(false);
                         return 8;
                     },
-                    0xC0 => { // SET 0, B
-                        self.b |= 0x01;
-                        return 8;
-                    },
-                    0x1B => { // RR E
-                        const orignal_e = self.e;
-                        const carry = (self.f & C_FLAG) != 0;
+                    0x13 => { // RL E
+                        const original_e = self.e;
+                        const carry_in: u8 = if (self.get_carry_flag()) 1 else 0;
                         self.f = 0;
-                        self.set_carry_flag((orignal_e & 0x01) != 0);
-                        self.e = orignal_e >> 1;
-                        if (carry) {
-                            self.e |= 0x80;
-                        }
+                        self.set_carry_flag((original_e & 0x80) != 0);
+                        self.e = (original_e << 1) | carry_in;
                         self.set_zero_flag(self.e == 0);
                         self.set_substract_flag(false);
                         self.set_half_carry_flag(false);
                         return 8;
                     },
-                    0x7C => { // BIT 7, H
-                        const c_flag_preserved = self.f & C_FLAG;
+                    0x14 => { // RL H
+                        const original_h = self.h;
+                        const carry_in: u8 = if (self.get_carry_flag()) 1 else 0;
                         self.f = 0;
-                        const bit_is_zero = ((self.h & (1 << 7)) == 0);
-                        self.set_zero_flag(bit_is_zero);
+                        self.set_carry_flag((original_h & 0x80) != 0);
+                        self.h = (original_h << 1) | carry_in;
+                        self.set_zero_flag(self.h == 0);
                         self.set_substract_flag(false);
-                        self.set_half_carry_flag(true);
-                        self.f |= c_flag_preserved;
+                        self.set_half_carry_flag(false);
                         return 8;
                     },
-                    0x37 => { // SWAP A 交换A寄存器的高4位和低4位
-                        const orignal_a = self.a;
-                        const high = orignal_a >> 4;
-                        const low = orignal_a & 0x0F;
-                        self.a = (low << 4) | high;
+                    0x15 => { // RL L
+                        const original_l = self.l;
+                        const carry_in: u8 = if (self.get_carry_flag()) 1 else 0;
+                        self.f = 0;
+                        self.set_carry_flag((original_l & 0x80) != 0);
+                        self.l = (original_l << 1) | carry_in;
+                        self.set_zero_flag(self.l == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(false);
+                        return 8;
+                    },
+                    0x16 => { // RL (HL)
+                        const addr = self.get_hl();
+                        const original_value = bus.read(addr);
+                        const carry_in: u8 = if (self.get_carry_flag()) 1 else 0;
+                        self.f = 0;
+                        self.set_carry_flag((original_value & 0x80) != 0);
+                        const new_value = (original_value << 1) | carry_in;
+                        bus.write(addr, new_value);
+                        self.set_zero_flag(new_value == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(false);
+                        return 16;
+                    },
+                    0x17 => { // RL A
+                        const original_a = self.a;
+                        const carry_in: u8 = if (self.get_carry_flag()) 1 else 0;
+                        self.f = 0;
+                        self.set_carry_flag((original_a & 0x80) != 0);
+                        self.a = (original_a << 1) | carry_in;
+                        self.set_zero_flag(self.a == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(false);
+                        return 8;
+                    },
+                    0x18 => { // RR B
+                        const original_b = self.b;
+                        const carry_in: u8 = if (self.get_carry_flag()) 1 else 0;
+                        self.f = 0;
+                        self.set_carry_flag((original_b & 0x01) != 0);
+                        self.b = original_b >> 1 | (carry_in << 7);
+                        self.set_zero_flag(self.b == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(false);
+                        return 8;
+                    },
+                    0x19 => { // RR C
+                        const original_c = self.c;
+                        const carry_in: u8 = if (self.get_carry_flag()) 1 else 0;
+                        self.f = 0;
+                        self.set_carry_flag((original_c & 0x01) != 0);
+                        self.c = original_c >> 1 | (carry_in << 7);
+                        self.set_zero_flag(self.c == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(false);
+                        return 8;
+                    },
+                    0x1A => { // RR D
+                        const original_d = self.d;
+                        const carry_in: u8 = if (self.get_carry_flag()) 1 else 0;
+                        self.f = 0;
+                        self.set_carry_flag((original_d & 0x01) != 0);
+                        self.d = original_d >> 1 | (carry_in << 7);
+                        self.set_zero_flag(self.d == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(false);
+                        return 8;
+                    },
+                    0x1B => { // RR E
+                        const original_e = self.e;
+                        const carry_in: u8 = if (self.get_carry_flag()) 1 else 0;
+                        self.f = 0;
+                        self.set_carry_flag((original_e & 0x01) != 0);
+                        self.e = original_e >> 1 | (carry_in << 7);
+                        self.set_zero_flag(self.e == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(false);
+                        return 8;
+                    },
+                    0x1C => { // RR H
+                        const original_h = self.h;
+                        const carry_in: u8 = if (self.get_carry_flag()) 1 else 0;
+                        self.f = 0;
+                        self.set_carry_flag((original_h & 0x01) != 0);
+                        self.h = original_h >> 1 | (carry_in << 7);
+                        self.set_zero_flag(self.h == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(false);
+                        return 8;
+                    },
+                    0x1D => { // RR L
+                        const original_l = self.l;
+                        const carry_in: u8 = if (self.get_carry_flag()) 1 else 0;
+                        self.f = 0;
+                        self.set_carry_flag((original_l & 0x01) != 0);
+                        self.l = original_l >> 1 | (carry_in << 7);
+                        self.set_zero_flag(self.l == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(false);
+                        return 8;
+                    },
+                    0x1E => { // RR (HL)
+                        const addr = self.get_hl();
+                        const original_value = bus.read(addr);
+                        const carry_in: u8 = if (self.get_carry_flag()) 1 else 0;
+                        self.f = 0;
+                        self.set_carry_flag((original_value & 0x01) != 0);
+                        const new_value = original_value >> 1 | (carry_in << 7);
+                        bus.write(addr, new_value);
+                        self.set_zero_flag(new_value == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(false);
+                        return 16;
+                    },
+                    0x1F => { // RR A
+                        const original_a = self.a;
+                        const carry_in: u8 = if (self.get_carry_flag()) 1 else 0;
+                        self.f = 0;
+                        self.set_carry_flag((original_a & 0x01) != 0);
+                        self.a = original_a >> 1 | (carry_in << 7);
+                        self.set_zero_flag(self.a == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(false);
+                        return 8;
+                    },
+                    0x20 => { // SLA B
+                        const original_b = self.b;
+                        self.f = 0;
+                        self.set_carry_flag((original_b & 0x80) != 0);
+                        self.b = original_b << 1;
+                        self.set_zero_flag(self.b == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(false);
+                        return 8;
+                    },
+                    0x21 => { // SLA C
+                        const original_c = self.c;
+                        self.f = 0;
+                        self.set_carry_flag((original_c & 0x80) != 0);
+                        self.c = original_c << 1;
+                        self.set_zero_flag(self.c == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(false);
+                        return 8;
+                    },
+                    0x22 => { // SLA D
+                        const original_d = self.d;
+                        self.f = 0;
+                        self.set_carry_flag((original_d & 0x80) != 0);
+                        self.d = original_d << 1;
+                        self.set_zero_flag(self.d == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(false);
+                        return 8;
+                    },
+                    0x23 => { // SLA E
+                        const original_e = self.e;
+                        self.f = 0;
+                        self.set_carry_flag((original_e & 0x80) != 0);
+                        self.e = original_e << 1;
+                        self.set_zero_flag(self.e == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(false);
+                        return 8;
+                    },
+
+                    0x24 => { // SLA H
+                        const original_h = self.h;
+                        self.f = 0;
+                        self.set_carry_flag((original_h & 0x80) != 0);
+                        self.h = original_h << 1;
+                        self.set_zero_flag(self.h == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(false);
+                        return 8;
+                    },
+                    0x25 => { // SLA L
+                        const original_l = self.l;
+                        self.f = 0;
+                        self.set_carry_flag((original_l & 0x80) != 0);
+                        self.l = original_l << 1;
+                        self.set_zero_flag(self.l == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(false);
+                        return 8;
+                    },
+                    0x26 => { // SLA (HL)
+                        const addr = self.get_hl();
+                        const original_val = bus.read(addr);
+                        self.f = 0;
+                        self.set_carry_flag((original_val & 0x80) != 0);
+                        const new_val = original_val << 1;
+                        bus.write(addr, new_val);
+                        self.set_zero_flag(new_val == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(false);
+                        return 16;
+                    },
+                    0x27 => { // SLA A
+                        const original_a = self.a;
+                        self.f = 0;
+                        self.set_carry_flag((original_a & 0x80) != 0);
+                        self.a = original_a << 1;
+                        self.set_zero_flag(self.a == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(false);
+                        return 8;
+                    },
+                    0x28 => { // SRA B
+                        const original_b = self.b;
+                        self.f = 0;
+                        self.set_carry_flag((original_b & 0x01) != 0);
+                        self.b = (original_b >> 1) | (original_b & 0x80); // Preserve bit 7
+                        self.set_zero_flag(self.b == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(false);
+                        return 8;
+                    },
+                    0x29 => { // SRA C
+                        const original_c = self.c;
+                        self.f = 0;
+                        self.set_carry_flag((original_c & 0x01) != 0);
+                        self.c = (original_c >> 1) | (original_c & 0x80);
+                        self.set_zero_flag(self.c == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(false);
+                        return 8;
+                    },
+                    0x2A => { // SRA D
+                        const original_d = self.d;
+                        self.f = 0;
+                        self.set_carry_flag((original_d & 0x01) != 0);
+                        self.d = (original_d >> 1) | (original_d & 0x80);
+                        self.set_zero_flag(self.d == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(false);
+                        return 8;
+                    },
+                    0x2B => { // SRA E
+                        const original_e = self.e;
+                        self.f = 0;
+                        self.set_carry_flag((original_e & 0x01) != 0);
+                        self.e = (original_e >> 1) | (original_e & 0x80);
+                        self.set_zero_flag(self.e == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(false);
+                        return 8;
+                    },
+                    0x2C => { // SRA H
+                        const original_h = self.h;
+                        self.f = 0;
+                        self.set_carry_flag((original_h & 0x01) != 0);
+                        self.h = (original_h >> 1) | (original_h & 0x80);
+                        self.set_zero_flag(self.h == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(false);
+                        return 8;
+                    },
+                    0x2D => { // SRA L
+                        const original_l = self.l;
+                        self.f = 0;
+                        self.set_carry_flag((original_l & 0x01) != 0);
+                        self.l = (original_l >> 1) | (original_l & 0x80);
+                        self.set_zero_flag(self.l == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(false);
+                        return 8;
+                    },
+                    0x2E => { // SRA (HL)
+                        const addr = self.get_hl();
+                        const original_val = bus.read(addr);
+                        self.f = 0;
+                        self.set_carry_flag((original_val & 0x01) != 0);
+                        const new_val = (original_val >> 1) | (original_val & 0x80);
+                        bus.write(addr, new_val);
+                        self.set_zero_flag(new_val == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(false);
+                        return 16;
+                    },
+                    0x2F => { // SRA A
+                        const original_a = self.a;
+                        self.f = 0;
+                        self.set_carry_flag((original_a & 0x01) != 0);
+                        self.a = (original_a >> 1) | (original_a & 0x80);
+                        self.set_zero_flag(self.a == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(false);
+                        return 8;
+                    },
+                    0x30 => { // SWAP B
+                        const original_b = self.b;
+                        self.b = (original_b << 4) | (original_b >> 4);
+                        self.f = 0;
+                        self.set_zero_flag(self.b == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(false);
+                        self.set_carry_flag(false);
+                        return 8;
+                    },
+                    0x31 => { // SWAP C
+                        const original_c = self.c;
+                        self.c = (original_c << 4) | (original_c >> 4);
+                        self.f = 0;
+                        self.set_zero_flag(self.c == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(false);
+                        self.set_carry_flag(false);
+                        return 8;
+                    },
+                    0x32 => { // SWAP D
+                        const original_d = self.d;
+                        self.d = (original_d << 4) | (original_d >> 4);
+                        self.f = 0;
+                        self.set_zero_flag(self.d == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(false);
+                        self.set_carry_flag(false);
+                        return 8;
+                    },
+                    0x33 => { // SWAP E
+                        const original_e = self.e;
+                        self.e = (original_e << 4) | (original_e >> 4);
+                        self.f = 0;
+                        self.set_zero_flag(self.e == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(false);
+                        self.set_carry_flag(false);
+                        return 8;
+                    },
+                    0x34 => { // SWAP H
+                        const original_h = self.h;
+                        self.h = (original_h << 4) | (original_h >> 4);
+                        self.f = 0;
+                        self.set_zero_flag(self.h == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(false);
+                        self.set_carry_flag(false);
+                        return 8;
+                    },
+                    0x35 => { // SWAP L
+                        const original_l = self.l;
+                        self.l = (original_l << 4) | (original_l >> 4);
+                        self.f = 0;
+                        self.set_zero_flag(self.l == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(false);
+                        self.set_carry_flag(false);
+                        return 8;
+                    },
+                    0x36 => { // SWAP (HL)
+                        const addr = self.get_hl();
+                        const original_val = bus.read(addr);
+                        const new_val = (original_val << 4) | (original_val >> 4);
+                        bus.write(addr, new_val);
+                        self.f = 0;
+                        self.set_zero_flag(new_val == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(false);
+                        self.set_carry_flag(false);
+                        return 16;
+                    },
+                    0x37 => { // SWAP A
+                        const original_a = self.a;
+                        self.a = (original_a << 4) | (original_a >> 4);
                         self.f = 0;
                         self.set_zero_flag(self.a == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(false);
+                        self.set_carry_flag(false);
                         return 8;
                     },
                     0x38 => { // SRL B
@@ -1970,45 +2514,1207 @@ pub const CPU = struct {
                         self.set_half_carry_flag(false);
                         return 8;
                     },
-                    0x3F => { // SRL A
-                        const orignal_a = self.a;
-                        self.f = 0;
-                        self.set_carry_flag((orignal_a & 0x01) != 0);
-                        self.a = orignal_a >> 1;
-                        self.set_zero_flag(self.a == 0);
-                        self.set_substract_flag(false);
-                        self.set_half_carry_flag(false);
-                        return 8;
-                    },
-                    0x19 => { // RR C
+                    0x39 => { // SRL C
                         const original_c = self.c;
-                        const carry_is_set = (self.f & C_FLAG) != 0;
                         self.f = 0;
                         self.set_carry_flag((original_c & 0x01) != 0);
                         self.c = original_c >> 1;
-                        if (carry_is_set) self.c |= 0x80;
                         self.set_zero_flag(self.c == 0);
                         self.set_substract_flag(false);
                         self.set_half_carry_flag(false);
                         return 8;
                     },
-                    0x1A => { // RR D
+                    0x3A => { // SRL D
                         const original_d = self.d;
-                        const carry_is_set = (self.f & C_FLAG) != 0;
                         self.f = 0;
                         self.set_carry_flag((original_d & 0x01) != 0);
                         self.d = original_d >> 1;
-                        if (carry_is_set) self.d |= 0x80;
                         self.set_zero_flag(self.d == 0);
                         self.set_substract_flag(false);
                         self.set_half_carry_flag(false);
                         return 8;
                     },
-
-                    else => |cb_op| {
-                        std.log.err("FATAL: Unimplemented CB opcode 0x{x:0>2} at PC=0x{x:0>4}", .{ cb_op, self.pc - 2 });
-                        unreachable;
+                    0x3B => { // SRL E
+                        const original_e = self.e;
+                        self.f = 0;
+                        self.set_carry_flag((original_e & 0x01) != 0);
+                        self.e = original_e >> 1;
+                        self.set_zero_flag(self.e == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(false);
+                        return 8;
                     },
+                    0x3C => { // SRL H
+                        const original_h = self.h;
+                        self.f = 0;
+                        self.set_carry_flag((original_h & 0x01) != 0);
+                        self.h = original_h >> 1;
+                        self.set_zero_flag(self.h == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(false);
+                        return 8;
+                    },
+                    0x3D => { // SRL L
+                        const original_l = self.l;
+                        self.f = 0;
+                        self.set_carry_flag((original_l & 0x01) != 0);
+                        self.l = original_l >> 1;
+                        self.set_zero_flag(self.l == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(false);
+                        return 8;
+                    },
+                    0x3E => { // SRL (HL)
+                        const addr = self.get_hl();
+                        const original_val = bus.read(addr);
+                        self.f = 0;
+                        self.set_carry_flag((original_val & 0x01) != 0);
+                        const new_val = original_val >> 1;
+                        bus.write(addr, new_val);
+                        self.set_zero_flag(new_val == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(false);
+                        return 16;
+                    },
+                    0x3F => { // SRL A
+                        const original_a = self.a;
+                        self.f = 0;
+                        self.set_carry_flag((original_a & 0x01) != 0);
+                        self.a = original_a >> 1;
+                        self.set_zero_flag(self.a == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(false);
+                        return 8;
+                    },
+                    0x40 => { // BIT 0, B
+                        const c_flag_preserved = self.f & C_FLAG;
+                        self.f = 0;
+                        self.set_zero_flag((self.b & (1 << 0)) == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(true);
+                        self.f |= c_flag_preserved;
+                        return 8;
+                    },
+                    0x41 => { // BIT 0, C
+                        const c_flag_preserved = self.f & C_FLAG;
+                        self.f = 0;
+                        self.set_zero_flag((self.c & (1 << 0)) == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(true);
+                        self.f |= c_flag_preserved;
+                        return 8;
+                    },
+                    0x42 => { // BIT 0, D
+                        const c_flag_preserved = self.f & C_FLAG;
+                        self.f = 0;
+                        self.set_zero_flag((self.d & (1 << 0)) == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(true);
+                        self.f |= c_flag_preserved;
+                        return 8;
+                    },
+                    0x43 => { // BIT 0, E
+                        const c_flag_preserved = self.f & C_FLAG;
+                        self.f = 0;
+                        self.set_zero_flag((self.e & (1 << 0)) == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(true);
+                        self.f |= c_flag_preserved;
+                        return 8;
+                    },
+                    0x44 => { // BIT 0, H
+                        const c_flag_preserved = self.f & C_FLAG;
+                        self.f = 0;
+                        self.set_zero_flag((self.h & (1 << 0)) == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(true);
+                        self.f |= c_flag_preserved;
+                        return 8;
+                    },
+                    0x45 => { // BIT 0, L
+                        const c_flag_preserved = self.f & C_FLAG;
+                        self.f = 0;
+                        self.set_zero_flag((self.l & (1 << 0)) == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(true);
+                        self.f |= c_flag_preserved;
+                        return 8;
+                    },
+                    0x46 => { // BIT 0, (HL)
+                        const c_flag_preserved = self.f & C_FLAG;
+                        self.f = 0;
+                        self.set_zero_flag((bus.read(self.get_hl()) & (1 << 0)) == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(true);
+                        self.f |= c_flag_preserved;
+                        return 12;
+                    },
+                    0x47 => { // BIT 0, A
+                        const c_flag_preserved = self.f & C_FLAG;
+                        self.f = 0;
+                        self.set_zero_flag((self.a & (1 << 0)) == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(true);
+                        self.f |= c_flag_preserved;
+                        return 8;
+                    },
+                    0x48 => { // BIT 1, B
+                        const c_flag_preserved = self.f & C_FLAG;
+                        self.f = 0;
+                        self.set_zero_flag((self.b & (1 << 1)) == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(true);
+                        self.f |= c_flag_preserved;
+                        return 8;
+                    },
+                    0x49 => { // BIT 1, C
+                        const c_flag_preserved = self.f & C_FLAG;
+                        self.f = 0;
+                        self.set_zero_flag((self.c & (1 << 1)) == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(true);
+                        self.f |= c_flag_preserved;
+                        return 8;
+                    },
+                    0x4A => { // BIT 1, D
+                        const c_flag_preserved = self.f & C_FLAG;
+                        self.f = 0;
+                        self.set_zero_flag((self.d & (1 << 1)) == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(true);
+                        self.f |= c_flag_preserved;
+                        return 8;
+                    },
+                    0x4B => { // BIT 1, E
+                        const c_flag_preserved = self.f & C_FLAG;
+                        self.f = 0;
+                        self.set_zero_flag((self.e & (1 << 1)) == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(true);
+                        self.f |= c_flag_preserved;
+                        return 8;
+                    },
+                    0x4C => { // BIT 1, H
+                        const c_flag_preserved = self.f & C_FLAG;
+                        self.f = 0;
+                        self.set_zero_flag((self.h & (1 << 1)) == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(true);
+                        self.f |= c_flag_preserved;
+                        return 8;
+                    },
+                    0x4D => { // BIT 1, L
+                        const c_flag_preserved = self.f & C_FLAG;
+                        self.f = 0;
+                        self.set_zero_flag((self.l & (1 << 1)) == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(true);
+                        self.f |= c_flag_preserved;
+                        return 8;
+                    },
+                    0x4E => { // BIT 1, (HL)
+                        const c_flag_preserved = self.f & C_FLAG;
+                        self.f = 0;
+                        self.set_zero_flag((bus.read(self.get_hl()) & (1 << 1)) == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(true);
+                        self.f |= c_flag_preserved;
+                        return 12;
+                    },
+                    0x4F => { // BIT 1, A
+                        const c_flag_preserved = self.f & C_FLAG;
+                        self.f = 0;
+                        self.set_zero_flag((self.a & (1 << 1)) == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(true);
+                        self.f |= c_flag_preserved;
+                        return 8;
+                    },
+                    0x50 => { // BIT 2, B
+                        const c_flag_preserved = self.f & C_FLAG;
+                        self.f = 0;
+                        self.set_zero_flag((self.b & (1 << 2)) == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(true);
+                        self.f |= c_flag_preserved;
+                        return 8;
+                    },
+                    0x51 => { // BIT 2, C
+                        const c_flag_preserved = self.f & C_FLAG;
+                        self.f = 0;
+                        self.set_zero_flag((self.c & (1 << 2)) == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(true);
+                        self.f |= c_flag_preserved;
+                        return 8;
+                    },
+                    0x52 => { // BIT 2, D
+                        const c_flag_preserved = self.f & C_FLAG;
+                        self.f = 0;
+                        self.set_zero_flag((self.d & (1 << 2)) == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(true);
+                        self.f |= c_flag_preserved;
+                        return 8;
+                    },
+                    0x53 => { // BIT 2, E
+                        const c_flag_preserved = self.f & C_FLAG;
+                        self.f = 0;
+                        self.set_zero_flag((self.e & (1 << 2)) == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(true);
+                        self.f |= c_flag_preserved;
+                        return 8;
+                    },
+                    0x54 => { // BIT 2, H
+                        const c_flag_preserved = self.f & C_FLAG;
+                        self.f = 0;
+                        self.set_zero_flag((self.h & (1 << 2)) == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(true);
+                        self.f |= c_flag_preserved;
+                        return 8;
+                    },
+                    0x55 => { // BIT 2, L
+                        const c_flag_preserved = self.f & C_FLAG;
+                        self.f = 0;
+                        self.set_zero_flag((self.l & (1 << 2)) == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(true);
+                        self.f |= c_flag_preserved;
+                        return 8;
+                    },
+                    0x56 => { // BIT 2, (HL)
+                        const c_flag_preserved = self.f & C_FLAG;
+                        self.f = 0;
+                        self.set_zero_flag((bus.read(self.get_hl()) & (1 << 2)) == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(true);
+                        self.f |= c_flag_preserved;
+                        return 12;
+                    },
+                    0x57 => { // BIT 2, A
+                        const c_flag_preserved = self.f & C_FLAG;
+                        self.f = 0;
+                        self.set_zero_flag((self.a & (1 << 2)) == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(true);
+                        self.f |= c_flag_preserved;
+                        return 8;
+                    },
+                    0x58 => { // BIT 3, B
+                        const c_flag_preserved = self.f & C_FLAG;
+                        self.f = 0;
+                        self.set_zero_flag((self.b & (1 << 3)) == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(true);
+                        self.f |= c_flag_preserved;
+                        return 8;
+                    },
+                    0x59 => { // BIT 3, C
+                        const c_flag_preserved = self.f & C_FLAG;
+                        self.f = 0;
+                        self.set_zero_flag((self.c & (1 << 3)) == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(true);
+                        self.f |= c_flag_preserved;
+                        return 8;
+                    },
+                    0x5A => { // BIT 3, D
+                        const c_flag_preserved = self.f & C_FLAG;
+                        self.f = 0;
+                        self.set_zero_flag((self.d & (1 << 3)) == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(true);
+                        self.f |= c_flag_preserved;
+                        return 8;
+                    },
+
+                    0x5B => { // BIT 3, E
+                        const c_flag_preserved = self.f & C_FLAG;
+                        self.f = 0;
+                        self.set_zero_flag((self.e & (1 << 3)) == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(true);
+                        self.f |= c_flag_preserved;
+                        return 8;
+                    },
+
+                    0x5C => { // BIT 3, H
+                        const c_flag_preserved = self.f & C_FLAG;
+                        self.f = 0;
+                        self.set_zero_flag((self.h & (1 << 3)) == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(true);
+                        self.f |= c_flag_preserved;
+                        return 8;
+                    },
+
+                    0x5D => { // BIT 3, L
+                        const c_flag_preserved = self.f & C_FLAG;
+                        self.f = 0;
+                        self.set_zero_flag((self.l & (1 << 3)) == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(true);
+                        self.f |= c_flag_preserved;
+                        return 8;
+                    },
+
+                    0x5E => { // BIT 3, (HL)
+                        const c_flag_preserved = self.f & C_FLAG;
+                        self.f = 0;
+                        self.set_zero_flag((bus.read(self.get_hl()) & (1 << 3)) == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(true);
+                        self.f |= c_flag_preserved;
+                        return 12;
+                    },
+
+                    0x5F => { // BIT 3, A
+                        const c_flag_preserved = self.f & C_FLAG;
+                        self.f = 0;
+                        self.set_zero_flag((self.a & (1 << 3)) == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(true);
+                        self.f |= c_flag_preserved;
+                        return 8;
+                    },
+
+                    0x60 => { // BIT 4, B
+                        const c_flag_preserved = self.f & C_FLAG;
+                        self.f = 0;
+                        self.set_zero_flag((self.b & (1 << 4)) == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(true);
+                        self.f |= c_flag_preserved;
+                        return 8;
+                    },
+
+                    0x61 => { // BIT 4, C
+                        const c_flag_preserved = self.f & C_FLAG;
+                        self.f = 0;
+                        self.set_zero_flag((self.c & (1 << 4)) == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(true);
+                        self.f |= c_flag_preserved;
+                        return 8;
+                    },
+
+                    0x62 => { // BIT 4, D
+                        const c_flag_preserved = self.f & C_FLAG;
+                        self.f = 0;
+                        self.set_zero_flag((self.d & (1 << 4)) == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(true);
+                        self.f |= c_flag_preserved;
+                        return 8;
+                    },
+
+                    0x63 => { // BIT 4, E
+                        const c_flag_preserved = self.f & C_FLAG;
+                        self.f = 0;
+                        self.set_zero_flag((self.e & (1 << 4)) == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(true);
+                        self.f |= c_flag_preserved;
+                        return 8;
+                    },
+
+                    0x64 => { // BIT 4, H
+                        const c_flag_preserved = self.f & C_FLAG;
+                        self.f = 0;
+                        self.set_zero_flag((self.h & (1 << 4)) == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(true);
+                        self.f |= c_flag_preserved;
+                        return 8;
+                    },
+                    0x65 => { // BIT 4, L
+                        const c_flag_preserved = self.f & C_FLAG;
+                        self.f = 0;
+                        self.set_zero_flag((self.l & (1 << 4)) == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(true);
+                        self.f |= c_flag_preserved;
+                        return 8;
+                    },
+
+                    0x66 => { // BIT 4, (HL)
+                        const c_flag_preserved = self.f & C_FLAG;
+                        self.f = 0;
+                        self.set_zero_flag((bus.read(self.get_hl()) & (1 << 4)) == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(true);
+                        self.f |= c_flag_preserved;
+                        return 12;
+                    },
+                    0x67 => { // BIT 4, A
+                        const c_flag_preserved = self.f & C_FLAG;
+                        self.f = 0;
+                        self.set_zero_flag((self.a & (1 << 4)) == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(true);
+                        self.f |= c_flag_preserved;
+                        return 8;
+                    },
+                    0x68 => { // BIT 5, B
+                        const c_flag_preserved = self.f & C_FLAG;
+                        self.f = 0;
+                        self.set_zero_flag((self.b & (1 << 5)) == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(true);
+                        self.f |= c_flag_preserved;
+                        return 8;
+                    },
+
+                    0x69 => { // BIT 5, C
+                        const c_flag_preserved = self.f & C_FLAG;
+                        self.f = 0;
+                        self.set_zero_flag((self.c & (1 << 5)) == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(true);
+                        self.f |= c_flag_preserved;
+                        return 8;
+                    },
+
+                    0x6A => { // BIT 5, D
+                        const c_flag_preserved = self.f & C_FLAG;
+                        self.f = 0;
+                        self.set_zero_flag((self.d & (1 << 5)) == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(true);
+                        self.f |= c_flag_preserved;
+                        return 8;
+                    },
+
+                    0x6B => { // BIT 5, E
+                        const c_flag_preserved = self.f & C_FLAG;
+                        self.f = 0;
+                        self.set_zero_flag((self.e & (1 << 5)) == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(true);
+                        self.f |= c_flag_preserved;
+                        return 8;
+                    },
+
+                    0x6C => { // BIT 5, H
+                        const c_flag_preserved = self.f & C_FLAG;
+                        self.f = 0;
+                        self.set_zero_flag((self.h & (1 << 5)) == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(true);
+                        self.f |= c_flag_preserved;
+                        return 8;
+                    },
+
+                    0x6D => { // BIT 5, L
+                        const c_flag_preserved = self.f & C_FLAG;
+                        self.f = 0;
+                        self.set_zero_flag((self.l & (1 << 5)) == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(true);
+                        self.f |= c_flag_preserved;
+                        return 8;
+                    },
+                    0x6E => { // BIT 5, (HL)
+                        const c_flag_preserved = self.f & C_FLAG;
+                        self.f = 0;
+                        self.set_zero_flag((bus.read(self.get_hl()) & (1 << 5)) == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(true);
+                        self.f |= c_flag_preserved;
+                        return 12;
+                    },
+
+                    0x6F => { // BIT 5, A
+                        const c_flag_preserved = self.f & C_FLAG;
+                        self.f = 0;
+                        self.set_zero_flag((self.a & (1 << 5)) == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(true);
+                        self.f |= c_flag_preserved;
+                        return 8;
+                    },
+
+                    0x70 => { // BIT 6, B
+                        const c_flag_preserved = self.f & C_FLAG;
+                        self.f = 0;
+                        self.set_zero_flag((self.b & (1 << 6)) == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(true);
+                        self.f |= c_flag_preserved;
+                        return 8;
+                    },
+
+                    0x71 => { // BIT 6, C
+                        const c_flag_preserved = self.f & C_FLAG;
+                        self.f = 0;
+                        self.set_zero_flag((self.c & (1 << 6)) == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(true);
+                        self.f |= c_flag_preserved;
+                        return 8;
+                    },
+                    0x72 => { // BIT 6, D
+                        const c_flag_preserved = self.f & C_FLAG;
+                        self.f = 0;
+                        self.set_zero_flag((self.d & (1 << 6)) == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(true);
+                        self.f |= c_flag_preserved;
+                        return 8;
+                    },
+
+                    0x73 => { // BIT 6, E
+                        const c_flag_preserved = self.f & C_FLAG;
+                        self.f = 0;
+                        self.set_zero_flag((self.e & (1 << 6)) == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(true);
+                        self.f |= c_flag_preserved;
+                        return 8;
+                    },
+                    0x74 => { // BIT 6, H
+                        const c_flag_preserved = self.f & C_FLAG;
+                        self.f = 0;
+                        self.set_zero_flag((self.h & (1 << 6)) == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(true);
+                        self.f |= c_flag_preserved;
+                        return 8;
+                    },
+                    0x75 => { // BIT 6, L
+                        const c_flag_preserved = self.f & C_FLAG;
+                        self.f = 0;
+                        self.set_zero_flag((self.l & (1 << 6)) == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(true);
+                        self.f |= c_flag_preserved;
+                        return 8;
+                    },
+
+                    0x76 => { // BIT 6, (HL)
+                        const c_flag_preserved = self.f & C_FLAG;
+                        self.f = 0;
+                        self.set_zero_flag((bus.read(self.get_hl()) & (1 << 6)) == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(true);
+                        self.f |= c_flag_preserved;
+                        return 12;
+                    },
+
+                    0x77 => { // BIT 6, A
+                        const c_flag_preserved = self.f & C_FLAG;
+                        self.f = 0;
+                        self.set_zero_flag((self.a & (1 << 6)) == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(true);
+                        self.f |= c_flag_preserved;
+                        return 8;
+                    },
+
+                    0x78 => { // BIT 7, B
+                        const c_flag_preserved = self.f & C_FLAG;
+                        self.f = 0;
+                        self.set_zero_flag((self.b & (1 << 7)) == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(true);
+                        self.f |= c_flag_preserved;
+                        return 8;
+                    },
+
+                    0x79 => { // BIT 7, C
+                        const c_flag_preserved = self.f & C_FLAG;
+                        self.f = 0;
+                        self.set_zero_flag((self.c & (1 << 7)) == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(true);
+                        self.f |= c_flag_preserved;
+                        return 8;
+                    },
+
+                    0x7A => { // BIT 7, D
+                        const c_flag_preserved = self.f & C_FLAG;
+                        self.f = 0;
+                        self.set_zero_flag((self.d & (1 << 7)) == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(true);
+                        self.f |= c_flag_preserved;
+                        return 8;
+                    },
+
+                    0x7B => { // BIT 7, E
+                        const c_flag_preserved = self.f & C_FLAG;
+                        self.f = 0;
+                        self.set_zero_flag((self.e & (1 << 7)) == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(true);
+                        self.f |= c_flag_preserved;
+                        return 8;
+                    },
+
+                    0x7C => { // BIT 7, H
+                        const c_flag_preserved = self.f & C_FLAG;
+                        self.f = 0;
+                        self.set_zero_flag((self.h & (1 << 7)) == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(true);
+                        self.f |= c_flag_preserved;
+                        return 8;
+                    },
+
+                    0x7D => { // BIT 7, L
+                        const c_flag_preserved = self.f & C_FLAG;
+                        self.f = 0;
+                        self.set_zero_flag((self.l & (1 << 7)) == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(true);
+                        self.f |= c_flag_preserved;
+                        return 8;
+                    },
+
+                    0x7E => { // BIT 7, (HL)
+                        const c_flag_preserved = self.f & C_FLAG;
+                        self.f = 0;
+                        self.set_zero_flag((bus.read(self.get_hl()) & (1 << 7)) == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(true);
+                        self.f |= c_flag_preserved;
+                        return 12;
+                    },
+                    0x7F => { // BIT 7, A
+                        const c_flag_preserved = self.f & C_FLAG;
+                        self.f = 0;
+                        self.set_zero_flag((self.a & (1 << 7)) == 0);
+                        self.set_substract_flag(false);
+                        self.set_half_carry_flag(true);
+                        self.f |= c_flag_preserved;
+                        return 8;
+                    },
+
+                    0x80 => { // RES 0, B
+                        self.b &= ~@as(u8, 1 << 0);
+                        return 8;
+                    },
+
+                    0x81 => { // RES 0, C
+                        self.c &= ~@as(u8, 1 << 0);
+                        return 8;
+                    },
+
+                    0x82 => { // RES 0, D
+                        self.d &= ~@as(u8, 1 << 0);
+                        return 8;
+                    },
+                    0x83 => { // RES 0, E
+                        self.e &= ~@as(u8, 1 << 0);
+                        return 8;
+                    },
+                    0x84 => { // RES 0, H
+                        self.h &= ~@as(u8, 1 << 0);
+                        return 8;
+                    },
+                    0x85 => { // RES 0, L
+                        self.l &= ~@as(u8, 1 << 0);
+                        return 8;
+                    },
+                    0x86 => { // RES 0, (HL)
+                        bus.write(self.get_hl(), bus.read(self.get_hl()) & ~@as(u8, 1 << 0));
+                        return 16;
+                    },
+                    0x87 => { // RES 0, A
+                        self.a &= ~@as(u8, 1 << 0);
+                        return 8;
+                    },
+                    0x88 => { // RES 1, B
+                        self.b &= ~@as(u8, 1 << 1);
+                        return 8;
+                    },
+
+                    0x89 => { // RES 1, C
+                        self.c &= ~@as(u8, 1 << 1);
+                        return 8;
+                    },
+                    0x8A => { // RES 1, D
+                        self.d &= ~@as(u8, 1 << 1);
+                        return 8;
+                    },
+                    0x8B => { // RES 1, E
+                        self.e &= ~@as(u8, 1 << 1);
+                        return 8;
+                    },
+                    0x8C => { // RES 1, H
+                        self.h &= ~@as(u8, 1 << 1);
+                        return 8;
+                    },
+                    0x8D => { // RES 1, L
+                        self.l &= ~@as(u8, 1 << 1);
+                        return 8;
+                    },
+                    0x8E => { // RES 1, (HL)
+                        bus.write(self.get_hl(), bus.read(self.get_hl()) & ~@as(u8, 1 << 1));
+                        return 16;
+                    },
+                    0x8F => { // RES 1, A
+                        self.a &= ~@as(u8, 1 << 1);
+                        return 8;
+                    },
+                    0x90 => { // RES 2, B
+                        self.b &= ~@as(u8, 1 << 2);
+                        return 8;
+                    },
+                    0x91 => { // RES 2, C
+                        self.c &= ~@as(u8, 1 << 2);
+                        return 8;
+                    },
+                    0x92 => { // RES 2, D
+                        self.d &= ~@as(u8, 1 << 2);
+                        return 8;
+                    },
+                    0x93 => { // RES 2, E
+                        self.e &= ~@as(u8, 1 << 2);
+                        return 8;
+                    },
+                    0x94 => { // RES 2, H
+                        self.h &= ~@as(u8, 1 << 2);
+                        return 8;
+                    },
+
+                    0x95 => { // RES 2, L
+                        self.l &= ~@as(u8, 1 << 2);
+                        return 8;
+                    },
+                    0x96 => { // RES 2, (HL)
+                        bus.write(self.get_hl(), bus.read(self.get_hl()) & ~@as(u8, 1 << 2));
+                        return 16;
+                    },
+                    0x97 => { // RES 2, A
+                        self.a &= ~@as(u8, 1 << 2);
+                        return 8;
+                    },
+                    0x98 => { // RES 3, B
+                        self.b &= ~@as(u8, 1 << 3);
+                        return 8;
+                    },
+                    0x99 => { // RES 3, C
+                        self.c &= ~@as(u8, 1 << 3);
+                        return 8;
+                    },
+                    0x9A => { // RES 3, D
+                        self.d &= ~@as(u8, 1 << 3);
+                        return 8;
+                    },
+                    0x9B => { // RES 3, E
+                        self.e &= ~@as(u8, 1 << 3);
+                        return 8;
+                    },
+                    0x9C => { // RES 3, H
+                        self.h &= ~@as(u8, 1 << 3);
+                        return 8;
+                    },
+                    0x9D => { // RES 3, L
+                        self.l &= ~@as(u8, 1 << 3);
+                        return 8;
+                    },
+                    0x9E => { // RES 3, (HL)
+                        bus.write(self.get_hl(), bus.read(self.get_hl()) & ~@as(u8, 1 << 3));
+                        return 16;
+                    },
+                    0x9F => { // RES 3, A
+                        self.a &= ~@as(u8, 1 << 3);
+                        return 8;
+                    },
+                    0xA0 => { // RES 4, B
+                        self.b &= ~@as(u8, 1 << 4);
+                        return 8;
+                    },
+                    0xA1 => { // RES 4, C
+                        self.c &= ~@as(u8, 1 << 4);
+                        return 8;
+                    },
+                    0xA2 => { // RES 4, D
+                        self.d &= ~@as(u8, 1 << 4);
+                        return 8;
+                    },
+                    0xA3 => { // RES 4, E
+                        self.e &= ~@as(u8, 1 << 4);
+                        return 8;
+                    },
+                    0xA4 => { // RES 4, H
+                        self.h &= ~@as(u8, 1 << 4);
+                        return 8;
+                    },
+                    0xA5 => { // RES 4, L
+                        self.l &= ~@as(u8, 1 << 4);
+                        return 8;
+                    },
+                    0xA6 => { // RES 4, (HL)
+                        bus.write(self.get_hl(), bus.read(self.get_hl()) & ~@as(u8, 1 << 4));
+                        return 16;
+                    },
+                    0xA7 => { // RES 4, A
+                        self.a &= ~@as(u8, 1 << 4);
+                        return 8;
+                    },
+                    0xA8 => { // RES 5, B
+                        self.b &= ~@as(u8, 1 << 5);
+                        return 8;
+                    },
+                    0xA9 => { // RES 5, C
+                        self.c &= ~@as(u8, 1 << 5);
+                        return 8;
+                    },
+                    0xAA => { // RES 5, D
+                        self.d &= ~@as(u8, 1 << 5);
+                        return 8;
+                    },
+                    0xAB => { // RES 5, E
+                        self.e &= ~@as(u8, 1 << 5);
+                        return 8;
+                    },
+                    0xAC => { // RES 5, H
+                        self.h &= ~@as(u8, 1 << 5);
+                        return 8;
+                    },
+                    0xAD => { // RES 5, L
+                        self.l &= ~@as(u8, 1 << 5);
+                        return 8;
+                    },
+                    0xAE => { // RES 5, (HL)
+                        bus.write(self.get_hl(), bus.read(self.get_hl()) & ~@as(u8, 1 << 5));
+                        return 16;
+                    },
+                    0xAF => { // RES 5, A
+                        self.a &= ~@as(u8, 1 << 5);
+                        return 8;
+                    },
+                    0xB0 => { // RES 6, B
+                        self.b &= ~@as(u8, 1 << 6);
+                        return 8;
+                    },
+                    0xB1 => { // RES 6, C
+                        self.c &= ~@as(u8, 1 << 6);
+                        return 8;
+                    },
+                    0xB2 => { // RES 6, D
+                        self.d &= ~@as(u8, 1 << 6);
+                        return 8;
+                    },
+                    0xB3 => { // RES 6, E
+                        self.e &= ~@as(u8, 1 << 6);
+                        return 8;
+                    },
+                    0xB4 => { // RES 6, H
+                        self.h &= ~@as(u8, 1 << 6);
+                        return 8;
+                    },
+                    0xB5 => { // RES 6, L
+                        self.l &= ~@as(u8, 1 << 6);
+                        return 8;
+                    },
+                    0xB6 => { // RES 6, (HL)
+                        bus.write(self.get_hl(), bus.read(self.get_hl()) & ~@as(u8, 1 << 6));
+                        return 16;
+                    },
+                    0xB7 => { // RES 6, A
+                        self.a &= ~@as(u8, 1 << 6);
+                        return 8;
+                    },
+                    0xB8 => { // RES 7, B
+                        self.b &= ~@as(u8, 1 << 7);
+                        return 8;
+                    },
+                    0xB9 => { // RES 7, C
+                        self.c &= ~@as(u8, 1 << 7);
+                        return 8;
+                    },
+                    0xBA => { // RES 7, D
+                        self.d &= ~@as(u8, 1 << 7);
+                        return 8;
+                    },
+                    0xBB => { // RES 7, E
+                        self.e &= ~@as(u8, 1 << 7);
+                        return 8;
+                    },
+                    0xBC => { // RES 7, H
+                        self.h &= ~@as(u8, 1 << 7);
+                        return 8;
+                    },
+                    0xBD => { // RES 7, L
+                        self.l &= ~@as(u8, 1 << 7);
+                        return 8;
+                    },
+
+                    0xBE => { // RES 7, (HL)
+                        bus.write(self.get_hl(), bus.read(self.get_hl()) & ~@as(u8, 1 << 7));
+                        return 16;
+                    },
+                    0xBF => { // RES 7, A
+                        self.a &= ~@as(u8, 1 << 7);
+                        return 8;
+                    },
+                    0xC0 => { // SET 0, B
+                        self.b |= @as(u8, 1 << 0);
+                        return 8;
+                    },
+
+                    0xC1 => { // SET 0, C
+                        self.c |= @as(u8, 1 << 0);
+                        return 8;
+                    },
+                    0xC2 => { // SET 0, D
+                        self.d |= @as(u8, 1 << 0);
+                        return 8;
+                    },
+                    0xC3 => { // SET 0, E
+                        self.e |= @as(u8, 1 << 0);
+                        return 8;
+                    },
+                    0xC4 => { // SET 0, H
+                        self.h |= @as(u8, 1 << 0);
+                        return 8;
+                    },
+                    0xC5 => { // SET 0, L
+                        self.l |= @as(u8, 1 << 0);
+                        return 8;
+                    },
+                    0xC6 => { // SET 0, (HL)
+                        bus.write(self.get_hl(), bus.read(self.get_hl()) | @as(u8, 1 << 0));
+                        return 16;
+                    },
+                    0xC7 => { // SET 0, A
+                        self.a |= @as(u8, 1 << 0);
+                        return 8;
+                    },
+                    0xC8 => { // SET 1, B
+                        self.b |= @as(u8, 1 << 1);
+                        return 8;
+                    },
+                    0xC9 => { // SET 1, C
+                        self.c |= @as(u8, 1 << 1);
+                        return 8;
+                    },
+                    0xCA => { // SET 1, D
+                        self.d |= @as(u8, 1 << 1);
+                        return 8;
+                    },
+                    0xCB => { // SET 1, E
+                        self.e |= @as(u8, 1 << 1);
+                        return 8;
+                    },
+                    0xCC => { // SET 1, H
+                        self.h |= @as(u8, 1 << 1);
+                        return 8;
+                    },
+                    0xCD => { // SET 1, L
+                        self.l |= @as(u8, 1 << 1);
+                        return 8;
+                    },
+                    0xCE => { // SET 1, (HL)
+                        bus.write(self.get_hl(), bus.read(self.get_hl()) | @as(u8, 1 << 1));
+                        return 16;
+                    },
+                    0xCF => { // SET 1, A
+                        self.a |= @as(u8, 1 << 1);
+                        return 8;
+                    },
+                    0xD0 => { // SET 2, B
+                        self.b |= @as(u8, 1 << 2);
+                        return 8;
+                    },
+                    0xD1 => { // SET 2, C
+                        self.c |= @as(u8, 1 << 2);
+                        return 8;
+                    },
+                    0xD2 => { // SET 2, D
+                        self.d |= @as(u8, 1 << 2);
+                        return 8;
+                    },
+                    0xD3 => { // SET 2, E
+                        self.e |= @as(u8, 1 << 2);
+                        return 8;
+                    },
+                    0xD4 => { // SET 2, H
+                        self.h |= @as(u8, 1 << 2);
+                        return 8;
+                    },
+                    0xD5 => { // SET 2, L
+                        self.l |= @as(u8, 1 << 2);
+                        return 8;
+                    },
+                    0xD6 => { // SET 2, (HL)
+                        bus.write(self.get_hl(), bus.read(self.get_hl()) | @as(u8, 1 << 2));
+                        return 16;
+                    },
+                    0xD7 => { // SET 2, A
+                        self.a |= @as(u8, 1 << 2);
+                        return 8;
+                    },
+                    0xD8 => { // SET 3, B
+                        self.b |= @as(u8, 1 << 3);
+                        return 8;
+                    },
+                    0xD9 => { // SET 3, C
+                        self.c |= @as(u8, 1 << 3);
+                        return 8;
+                    },
+                    0xDA => { // SET 3, D
+                        self.d |= @as(u8, 1 << 3);
+                        return 8;
+                    },
+                    0xDB => { // SET 3, E
+                        self.e |= @as(u8, 1 << 3);
+                        return 8;
+                    },
+                    0xDC => { // SET 3, H
+                        self.h |= @as(u8, 1 << 3);
+                        return 8;
+                    },
+                    0xDD => { // SET 3, L
+                        self.l |= @as(u8, 1 << 3);
+                        return 8;
+                    },
+                    0xDE => { // SET 3, (HL)
+                        bus.write(self.get_hl(), bus.read(self.get_hl()) | @as(u8, 1 << 3));
+                        return 16;
+                    },
+                    0xDF => { // SET 3, A
+                        self.a |= @as(u8, 1 << 3);
+                        return 8;
+                    },
+                    0xE0 => { // SET 4, B
+                        self.b |= @as(u8, 1 << 4);
+                        return 8;
+                    },
+                    0xE1 => { // SET 4, C
+                        self.c |= @as(u8, 1 << 4);
+                        return 8;
+                    },
+                    0xE2 => { // SET 4, D
+                        self.d |= @as(u8, 1 << 4);
+                        return 8;
+                    },
+                    0xE3 => { // SET 4, E
+                        self.e |= @as(u8, 1 << 4);
+                        return 8;
+                    },
+                    0xE4 => { // SET 4, H
+                        self.h |= @as(u8, 1 << 4);
+                        return 8;
+                    },
+
+                    0xE5 => { // SET 4, L
+                        self.l |= @as(u8, 1 << 4);
+                        return 8;
+                    },
+                    0xE6 => { // SET 4, (HL)
+                        bus.write(self.get_hl(), bus.read(self.get_hl()) | @as(u8, 1 << 4));
+                        return 16;
+                    },
+                    0xE7 => { // SET 4, A
+                        self.a |= @as(u8, 1 << 4);
+                        return 8;
+                    },
+                    0xE8 => { // SET 5, B
+                        self.b |= @as(u8, 1 << 5);
+                        return 8;
+                    },
+                    0xE9 => { // SET 5, C
+                        self.c |= @as(u8, 1 << 5);
+                        return 8;
+                    },
+                    0xEA => { // SET 5, D
+                        self.d |= @as(u8, 1 << 5);
+                        return 8;
+                    },
+                    0xEB => { // SET 5, E
+                        self.e |= @as(u8, 1 << 5);
+                        return 8;
+                    },
+                    0xEC => { // SET 5, H
+                        self.h |= @as(u8, 1 << 5);
+                        return 8;
+                    },
+                    0xED => { // SET 5, L
+                        self.l |= @as(u8, 1 << 5);
+                        return 8;
+                    },
+                    0xEE => { // SET 5, (HL)
+                        bus.write(self.get_hl(), bus.read(self.get_hl()) | @as(u8, 1 << 5));
+                        return 16;
+                    },
+                    0xEF => { // SET 5, A
+                        self.a |= @as(u8, 1 << 5);
+                        return 8;
+                    },
+                    0xF0 => { // SET 6, B
+                        self.b |= @as(u8, 1 << 6);
+                        return 8;
+                    },
+                    0xF1 => { // SET 6, C
+                        self.c |= @as(u8, 1 << 6);
+                        return 8;
+                    },
+                    0xF2 => { // SET 6, D
+                        self.d |= @as(u8, 1 << 6);
+                        return 8;
+                    },
+                    0xF3 => { // SET 6, E
+                        self.e |= @as(u8, 1 << 6);
+                        return 8;
+                    },
+                    0xF4 => { // SET 6, H
+                        self.h |= @as(u8, 1 << 6);
+                        return 8;
+                    },
+                    0xF5 => { // SET 6, L
+                        self.l |= @as(u8, 1 << 6);
+                        return 8;
+                    },
+                    0xF6 => { // SET 6, (HL)
+                        bus.write(self.get_hl(), bus.read(self.get_hl()) | @as(u8, 1 << 6));
+                        return 16;
+                    },
+                    0xF7 => { // SET 6, A
+                        self.a |= @as(u8, 1 << 6);
+                        return 8;
+                    },
+                    0xF8 => { // SET 7, B
+                        self.b |= @as(u8, 1 << 7);
+                        return 8;
+                    },
+                    0xF9 => { // SET 7, C
+                        self.c |= @as(u8, 1 << 7);
+                        return 8;
+                    },
+                    0xFA => { // SET 7, D
+                        self.d |= @as(u8, 1 << 7);
+                        return 8;
+                    },
+                    0xFB => { // SET 7, E
+                        self.e |= @as(u8, 1 << 7);
+                        return 8;
+                    },
+                    0xFC => { // SET 7, H
+                        self.h |= @as(u8, 1 << 7);
+                        return 8;
+                    },
+                    0xFD => { // SET 7, L
+                        self.l |= @as(u8, 1 << 7);
+                        return 8;
+                    },
+                    0xFE => { // SET 7, (HL)
+                        bus.write(self.get_hl(), bus.read(self.get_hl()) | @as(u8, 1 << 7));
+                        return 16;
+                    },
+                    0xFF => { // SET 7, A
+                        self.a |= @as(u8, 1 << 7);
+                        return 8;
+                    },
+                    // else => |cb_op| {
+                    //     std.log.err("FATAL: Unimplemented CB opcode 0x{x:0>2} at PC=0x{x:0>4}", .{ cb_op, self.pc - 2 });
+                    //     unreachable;
+                    // },
                 }
             },
             0xCC => {
