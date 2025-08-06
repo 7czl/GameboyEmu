@@ -115,7 +115,7 @@ pub const Bus = struct {
                     },
                     0xFF01 => {
                         self.io_registers[0x01] = value;
-                        // std.log.debug("Write SB (Serial Data)=0x{x:0>2} ('{c}')", .{ value, if (value >= 32 and value < 127) value else '?' });
+                        std.log.debug("Write SB (Serial Data)=0x{x:0>2} ('{c}')", .{ value, if (value >= 32 and value < 127) value else '?' });
                         return;
                     },
                     0xFF02 => {
@@ -124,10 +124,12 @@ pub const Bus = struct {
                             std.io.getStdOut().writer().print("{c}", .{char}) catch |err| {
                                 std.log.err("Error printing char to serial: {s}", .{@errorName(err)});
                             };
+                            std.log.debug("SERIAL OUT: 0x{x:0>2} ('{c}')", .{ value, char });
                             // Transfer complete, clear bit 7
                             self.io_registers[address - 0xFF00] = value & 0x7F;
                         } else {
                             self.io_registers[address - 0xFF00] = value;
+                            std.log.debug("Write SC (Serial Control)=0x{x:0>2}", .{value});
                         }
                         return;
                     },
