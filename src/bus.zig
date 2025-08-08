@@ -56,7 +56,10 @@ pub const Bus = struct {
                     0xFF06 => return self.timer.tma,
                     0xFF07 => return self.timer.tac,
                     0xFF44 => return self.ppu.ly,
-                    0xFF0F => return self.interrupt_flag,
+                    0xFF0F => {
+                std.log.debug("BUS: Read IF = 0x{X:0>2}", .{self.interrupt_flag});
+                return self.interrupt_flag;
+            },
                     0xFF01 => {
                         // std.log.debug("Read SB (Serial Data): 0x{x:0>2}", .{self.io_registers[0x01]});
                         return self.io_registers[0x01];

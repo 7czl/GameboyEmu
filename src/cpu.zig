@@ -36,56 +36,42 @@ pub const CPU = struct {
         };
     }
     pub fn step(self: *CPU, bus: *Bus) u8 {
-        std.log.debug("CPU Step: PC=0x{X:0>4}, SP=0x{X:0>4}, A={X:0>2} F={X:0>2} B={X:0>2} C={X:0>2} D={X:0>2} E={X:0>2} H={X:0>2} L={X:0>2}, IME={}, Haltd={}, HaltBug={}", .{ self.pc, self.sp, self.a, self.f, self.b, self.c, self.d, self.e, self.h, self.l, self.interrupt_master_enable, self.halted, self.halt_bug_active });
+        // std.log.debug("CPU Step: PC=0x{X:0>4}, SP=0x{X:0>4}, A={X:0>2} F={X:0>2} B={X:0>2} C={X:0>2} D={X:0>2} E={X:0>2} H={X:0>2} L={X:0>2}, IME={}, Haltd={}, HaltBug={}", .{ self.pc, self.sp, self.a, self.f, self.b, self.c, self.d, self.e, self.h, self.l, self.interrupt_master_enable, self.halted, self.halt_bug_active });
 
         // Handle scheduled IME enable (EI instruction)
         if (self.ime_scheduled) {
             self.interrupt_master_enable = true;
             self.ime_scheduled = false;
-            std.log.debug("CPU: IME enabled (scheduled)", .{});
+            // std.log.debug("CPU: IME enabled (scheduled)", .{});
         }
 
         // --- Interrupt Handling (before instruction fetch/execution) ---
         // This is crucial for correct interrupt timing and HALT behavior.
-        const interrupt_enable_reg = bus.read(0xFFFF);
-        const pending_interrupts = bus.interrupt_flag & interrupt_enable_reg;
-
         // If CPU is halted and an interrupt is pending, exit HALT
         if (self.halted) {
+            const interrupt_enable_reg = bus.read(0xFFFF);
+            const pending_interrupts = bus.interrupt_flag & interrupt_enable_reg;
             if (pending_interrupts != 0) {
                 self.halted = false;
-                std.log.debug("CPU: Exiting HALT due to pending interrupt. IF=0x{X:0>2}, IE=0x{X:0>2}", .{ bus.interrupt_flag, interrupt_enable_reg });
-                if (self.halt_bug_active) {
-                    self.pc += 1; // Skip the instruction that would have been executed after HALT
-                    self.halt_bug_active = false; // Reset the flag
-                    std.log.debug("CPU: HALT bug triggered, PC advanced to 0x{X:0>4} (skipping next instruction)", .{self.pc});
-                }
             } else {
-                // Still halted, no interrupt to wake up
-                std.log.debug("CPU: Still Halted at PC=0x{X:0>4}, IF=0x{X:0>2}, IE=0x{X:0>2}", .{ self.pc, bus.interrupt_flag, interrupt_enable_reg });
-                return 4; // Consume cycles for being halted
+                return 4;
             }
         }
 
-        // If IME is enabled and there are pending *and enabled* interrupts, handle them now.
+        const interrupt_enable_reg = bus.read(0xFFFF);
+        const pending_interrupts = bus.interrupt_flag & interrupt_enable_reg;
         if (self.interrupt_master_enable and pending_interrupts != 0) {
             self.handle_interrupts(bus); // This will push PC and jump to vector
             return 20; // Cycles for interrupt handling (RST + push/pop)
         }
 
-        // --- Normal Instruction Fetch & Execution ---
         const cycles = self.execute_instruction(bus);
 
-        std.log.debug("CPU Step End: Cycles={d}", .{cycles});
         return cycles;
     }
     fn execute_instruction(self: *CPU, bus: *Bus) u8 {
-        if (self.halted) {
-            std.log.debug("CPU Halted at PC=0x{x:0>4}, IF=0x{x:0>2}, IE=0x{x:0>2}, IME={}", .{ self.pc, bus.interrupt_flag, bus.read(0xFFFF), self.interrupt_master_enable });
-            return 4;
-        }
         const opcode = bus.read(self.pc);
-        // std.log.info("PC: 0x{x:0>4} | opcode: 0x{x:0>2}", .{ self.pc, opcode });
+        std.log.info("PC: 0x{x:0>4} | opcode: 0x{x:0>2}", .{ self.pc, opcode });
 
         switch (opcode) {
             0x00 => { //  NOP
@@ -980,15 +966,9 @@ pub const CPU = struct {
                 self.pc += 1;
                 return 8;
             },
-            0x76 => { //HALT
-                const interrupt_enable = bus.read(0xFFFF);
-                if (!self.interrupt_master_enable and (interrupt_enable & bus.interrupt_flag) != 0) {
-                    // IME 是0 但是有中断请求 则进入 HALT BUG 状态
-                    self.halt_bug_active = true;
-                }
+            0x76 => { // HALT
                 self.halted = true;
                 self.pc += 1;
-                std.log.debug("HALT at PC=0x{x:0>4}, IF=0x{x:0>2}, IE=0x{x:0>2}", .{ self.pc, bus.interrupt_flag, bus.read(0xFFFF) });
                 return 4;
             },
             0x77 => { // LD (HL), A
@@ -4218,13 +4198,7 @@ pub const CPU = struct {
     pub fn handle_interrupts(self: *CPU, bus: *Bus) void {
         const fired_interrupts = bus.interrupt_flag & bus.interrupt_enable_register;
         if (fired_interrupts == 0) return;
-
-        if (self.halted) {
-            self.halted = false;
-        }
-
         if (!self.interrupt_master_enable) return;
-
         for (0..5) |i| {
             const interrupt_mask = @as(u8, 1) << @intCast(i);
             if (fired_interrupts & interrupt_mask != 0) {
