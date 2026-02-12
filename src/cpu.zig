@@ -23,16 +23,21 @@ pub const CPU = struct {
     const C_FLAG: u8 = 1 << 4; // 0b00010000
     pub fn init() CPU {
         return CPU{
-            .a = 0x01,
-            .f = 0xB0,
-            .b = 0x00,
-            .c = 0x13,
-            .d = 0x00,
-            .e = 0xD8,
-            .h = 0x01,
-            .l = 0x4D,
-            .pc = 0x0100,
-            .sp = 0xFFFE,
+            .a = 0,
+            .f = 0,
+            .b = 0,
+            .c = 0,
+            .d = 0,
+            .e = 0,
+            .h = 0,
+            .l = 0,
+            .pc = 0x0000,
+            .sp = 0x0000,
+            .cycles = 0,
+            .interrupt_master_enable = false,
+            .halted = false,
+            .ime_scheduled = false,
+            .halt_bug_active = false,
         };
     }
     pub fn step(self: *CPU, bus: *Bus) u8 {
@@ -65,13 +70,26 @@ pub const CPU = struct {
             return 20; // Cycles for interrupt handling (RST + push/pop)
         }
 
+        // HALT bug: the instruction executes normally, but PC fails to
+        // increment — effectively the next byte is read twice.
+        const saved_pc = self.pc;
+        const halt_bug = self.halt_bug_active;
+        if (halt_bug) {
+            self.halt_bug_active = false;
+        }
+
         const cycles = self.execute_instruction(bus);
+
+        if (halt_bug) {
+            // Undo the PC advancement so the same opcode byte is fetched again
+            self.pc = saved_pc;
+        }
 
         return cycles;
     }
     fn execute_instruction(self: *CPU, bus: *Bus) u8 {
         const opcode = bus.read(self.pc);
-        std.log.info("PC: 0x{x:0>4} | opcode: 0x{x:0>2}", .{ self.pc, opcode });
+        // std.log.info("PC: 0x{x:0>4} | opcode: 0x{x:0>2}", .{ self.pc, opcode });
 
         switch (opcode) {
             0x00 => { //  NOP
@@ -675,7 +693,6 @@ pub const CPU = struct {
             0x3E => { // LD A, u8
                 const v = bus.read(self.pc + 1);
                 self.a = v;
-                std.log.debug("LD A, 0x{x:0>2}", .{v});
                 self.pc += 2;
                 return 8;
             },
@@ -709,8 +726,8 @@ pub const CPU = struct {
                 self.pc += 1;
                 return 4;
             },
-            0x44 => { // LD B, D
-                self.b = self.d;
+            0x44 => { // LD B, H
+                self.b = self.h;
                 self.pc += 1;
                 return 4;
             },
@@ -967,8 +984,18 @@ pub const CPU = struct {
                 return 8;
             },
             0x76 => { // HALT
-                self.halted = true;
-                self.pc += 1;
+                const ie = bus.read(0xFFFF);
+                const pending = bus.interrupt_flag & ie;
+                if (!self.interrupt_master_enable and pending != 0) {
+                    // HALT bug: IME is off but there's a pending interrupt.
+                    // CPU does NOT halt; instead the next instruction's PC
+                    // increment is skipped (the byte after HALT is read twice).
+                    self.halt_bug_active = true;
+                    self.pc += 1;
+                } else {
+                    self.halted = true;
+                    self.pc += 1;
+                }
                 return 4;
             },
             0x77 => { // LD (HL), A
@@ -1879,7 +1906,6 @@ pub const CPU = struct {
                 return 16;
             },
             0xCA => { // JP Z, u16
-                std.log.debug("JP Z, u16: Z={d}, PC=0x{x:0>4}, Target=0x{x:0>4}", .{ @intFromBool(self.get_zero_flag()), self.pc, self.read_u16(bus) });
                 const target_addr = self.read_u16(bus);
                 if (self.get_zero_flag()) {
                     self.pc = target_addr;
@@ -3697,22 +3723,22 @@ pub const CPU = struct {
                     // },
                 }
             },
-            0xCC => {
+            0xCC => { // CALL Z, u16
                 const addr_lo: u8 = bus.read(self.pc + 1);
                 const addr_hi: u8 = bus.read(self.pc + 2);
                 const target_addr: u16 = (@as(u16, addr_hi) << 8) | addr_lo;
                 self.pc += 3;
 
-                if (self.f & 0x40 != 0) { // 检查 Z 标志
+                if (self.get_zero_flag()) {
                     self.sp -%= 1;
                     bus.write(self.sp, @truncate(self.pc >> 8));
                     self.sp -%= 1;
                     bus.write(self.sp, @truncate(self.pc));
                     self.pc = target_addr;
-                    return 24; // Z=1，24 个 T 周期
+                    return 24;
                 }
 
-                return 12; // Z=0，12 个 T 周期
+                return 12;
             },
             0xCD => { // CALL u16
                 const low = bus.read(self.pc + 1);
@@ -3918,7 +3944,6 @@ pub const CPU = struct {
                 const offset = bus.read(self.pc + 1);
                 const target_addr = 0xFF00 + @as(u16, offset);
                 bus.write(target_addr, self.a);
-                std.log.debug("LD (0x{x:0>4}), A=0x{x:0>2}", .{ target_addr, self.a });
                 self.pc += 2;
                 return 12;
             },

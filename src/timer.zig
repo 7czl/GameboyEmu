@@ -30,11 +30,9 @@ pub const Timer = struct {
                 if (self.tima == 0xFF) {
                     self.tima = self.tma;
                     bus.request_interrupt(Bus.Interrupt.Timer);
-                    std.log.debug("TIMER: Timer overflow, requesting Timer interrupt", .{});
                 } else {
                     self.tima += 1;
                 }
-                std.log.debug("TIMER: Incremented tima to {d}", .{self.tima});
             }
         } else {
             // std.log.debug("TIMER: Timer not enabled, skipping step", .{});
