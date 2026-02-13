@@ -61,7 +61,7 @@ pub const Ppu = struct {
     /// Evaluate the STAT interrupt line and fire on rising edge.
     /// The various STAT sources are ORed together; an interrupt is
     /// requested only on a low-to-high transition (STAT blocking).
-    fn update_stat_irq(self: *Ppu, bus: *Bus) void {
+    pub fn update_stat_irq(self: *Ppu, bus: *Bus) void {
         const mode_val = @intFromEnum(self.mode);
         var line = false;
 
@@ -104,6 +104,15 @@ pub const Ppu = struct {
         return DMG_COLORS[shade];
     }
 
+    /// Direct VRAM/OAM read — avoids calling bus methods (Zig 0.15 circular dep workaround)
+    fn vram_read(bus: *Bus, address: u16) u8 {
+        return switch (address) {
+            0x8000...0x9FFF => bus.vram[address - 0x8000],
+            0xFE00...0xFE9F => bus.oam[address - 0xFE00],
+            else => 0xFF,
+        };
+    }
+
     /// Render one scanline of the background layer
     fn render_bg_scanline(self: *Ppu, bus: *Bus) void {
         const display = self.display orelse return;
@@ -130,7 +139,7 @@ pub const Ppu = struct {
             const tile_col = (x >> 3) & 0x1F;
             const tile_row = (y >> 3) & 0x1F;
             const map_addr = tile_map_base + @as(u16, tile_row) * 32 + tile_col;
-            const tile_id = bus.read(map_addr);
+            const tile_id = vram_read(bus, map_addr);
 
             // Tile data address
             const tile_addr: u16 = if (tile_data_unsigned)
@@ -144,8 +153,8 @@ pub const Ppu = struct {
             // Row within the tile (0-7)
             const tile_y: u16 = y & 0x07;
             const data_addr = tile_addr + tile_y * 2;
-            const lo = bus.read(data_addr);
-            const hi = bus.read(data_addr + 1);
+            const lo = vram_read(bus, data_addr);
+            const hi = vram_read(bus, data_addr + 1);
 
             // Bit within the row (7 = leftmost pixel)
             const bit: u3 = @intCast(7 - (x & 0x07));
@@ -179,7 +188,7 @@ pub const Ppu = struct {
             const tile_col = (win_x >> 3) & 0x1F;
             const tile_row = (win_y >> 3) & 0x1F;
             const map_addr = tile_map_base + @as(u16, tile_row) * 32 + tile_col;
-            const tile_id = bus.read(map_addr);
+            const tile_id = vram_read(bus, map_addr);
 
             const tile_addr: u16 = if (tile_data_unsigned)
                 0x8000 + @as(u16, tile_id) * 16
@@ -191,8 +200,8 @@ pub const Ppu = struct {
 
             const tile_y: u16 = win_y & 0x07;
             const data_addr = tile_addr + tile_y * 2;
-            const lo = bus.read(data_addr);
-            const hi = bus.read(data_addr + 1);
+            const lo = vram_read(bus, data_addr);
+            const hi = vram_read(bus, data_addr + 1);
 
             const bit: u3 = @intCast(7 - (win_x & 0x07));
             const color_id: u2 = @truncate(
@@ -224,7 +233,7 @@ pub const Ppu = struct {
 
         for (0..40) |i| {
             const oam_offset: u16 = @intCast(i * 4);
-            const sprite_y = @as(i16, bus.read(0xFE00 + oam_offset)) - 16;
+            const sprite_y = @as(i16, vram_read(bus, 0xFE00 + oam_offset)) - 16;
             const ly_i16: i16 = @intCast(self.ly);
 
             if (ly_i16 >= sprite_y and ly_i16 < sprite_y + sprite_height) {
@@ -240,10 +249,10 @@ pub const Ppu = struct {
             idx -= 1;
             const i = sprite_indices[idx];
             const oam_base: u16 = 0xFE00 + @as(u16, i) * 4;
-            const sprite_y = @as(i16, bus.read(oam_base)) - 16;
-            const sprite_x = @as(i16, bus.read(oam_base + 1)) - 8;
-            var tile_id = bus.read(oam_base + 2);
-            const attrs = bus.read(oam_base + 3);
+            const sprite_y = @as(i16, vram_read(bus, oam_base)) - 16;
+            const sprite_x = @as(i16, vram_read(bus, oam_base + 1)) - 8;
+            var tile_id = vram_read(bus, oam_base + 2);
+            const attrs = vram_read(bus, oam_base + 3);
 
             const bg_priority = (attrs & 0x80) != 0;
             const y_flip = (attrs & 0x40) != 0;
@@ -258,8 +267,8 @@ pub const Ppu = struct {
 
             const line_u16: u16 = @intCast(line);
             const tile_addr: u16 = 0x8000 + @as(u16, tile_id) * 16 + line_u16 * 2;
-            const lo = bus.read(tile_addr);
-            const hi = bus.read(tile_addr + 1);
+            const lo = vram_read(bus, tile_addr);
+            const hi = vram_read(bus, tile_addr + 1);
 
             for (0..8) |px| {
                 const screen_x = sprite_x + @as(i16, @intCast(px));
@@ -281,8 +290,9 @@ pub const Ppu = struct {
                 if (bg_priority) {
                     const sx: u32 = @intCast(screen_x);
                     const fb_idx = @as(u32, self.ly) * 160 + sx;
-                    if (fb_idx < display.framebuffer.len) {
-                        const existing = display.framebuffer[fb_idx];
+                    const back_buf = &display.buffers[display.back];
+                    if (fb_idx < back_buf.len) {
+                        const existing = back_buf[fb_idx];
                         if (existing != palette_color(self.bgp, 0)) continue;
                     }
                 }
@@ -319,10 +329,10 @@ pub const Ppu = struct {
             .Drawing => {
                 if (self.cycle_counter >= 172) {
                     self.cycle_counter -= 172;
+                    // Render scanline at end of Drawing, before HBlank fires
+                    self.render_scanline(bus);
                     self.mode = .HBlank;
                     self.set_mode(bus);
-                    // Render the scanline at end of Drawing mode
-                    self.render_scanline(bus);
                 }
             },
             .HBlank => {
@@ -332,17 +342,12 @@ pub const Ppu = struct {
 
                     if (self.ly == 144) {
                         self.mode = .VBlank;
-                        // VBlank interrupt is separate from STAT
                         bus.request_interrupt(.VBlank);
                         self.set_mode(bus);
-                        // Check LYC after mode change so both can contribute
                         self.check_lyc(bus);
-                        // Present the frame
                         if (self.display) |d| d.update();
                     } else {
                         self.mode = .OAMScan;
-                        // Check LYC before set_mode so LYC coincidence flag
-                        // is set when OAM mode evaluates the STAT line
                         self.check_lyc(bus);
                         self.set_mode(bus);
                     }

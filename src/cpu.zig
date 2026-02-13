@@ -16,6 +16,7 @@ pub const CPU = struct {
     halted: bool = false,
     ime_scheduled: bool = false,
     halt_bug_active: bool = false,
+    ticked_cycles: u32 = 0, // cycles ticked during current instruction
 
     const Z_FLAG: u8 = 1 << 7; // 0b10000000
     const N_FLAG: u8 = 1 << 6; // 0b01000000
@@ -38,58 +39,108 @@ pub const CPU = struct {
             .halted = false,
             .ime_scheduled = false,
             .halt_bug_active = false,
+            .ticked_cycles = 0,
         };
     }
-    pub fn step(self: *CPU, bus: *Bus) u8 {
-        // std.log.debug("CPU Step: PC=0x{X:0>4}, SP=0x{X:0>4}, A={X:0>2} F={X:0>2} B={X:0>2} C={X:0>2} D={X:0>2} E={X:0>2} H={X:0>2} L={X:0>2}, IME={}, Haltd={}, HaltBug={}", .{ self.pc, self.sp, self.a, self.f, self.b, self.c, self.d, self.e, self.h, self.l, self.interrupt_master_enable, self.halted, self.halt_bug_active });
+    pub fn step(self: *CPU, bus: *Bus) u32 {
+        // If CPU is halted, tick one M-cycle and check for wake
+        if (self.halted) {
+            self.tick(bus, 4);
+            const pending = bus.interrupt_flag & bus.interrupt_enable_register;
+            if (pending != 0) {
+                self.halted = false;
+            }
+            return 4;
+        }
 
-        // Handle scheduled IME enable (EI instruction)
+        // Check for pending interrupts
+        const pending = bus.interrupt_flag & bus.interrupt_enable_register;
+        if (self.interrupt_master_enable and pending != 0) {
+            // Interrupt dispatch takes 5 M-cycles:
+            // 2 internal cycles + push PC (2 writes) + jump (1 read-like)
+            self.tick(bus, 4); // internal delay 1
+            self.tick(bus, 4); // internal delay 2
+            self.interrupt_master_enable = false;
+
+            const fired = bus.interrupt_flag & bus.interrupt_enable_register;
+            for (0..5) |i| {
+                const mask = @as(u8, 1) << @intCast(i);
+                if (fired & mask != 0) {
+                    bus.interrupt_flag &= ~mask;
+                    // Push PC high byte
+                    self.sp -%= 1;
+                    bus.write(self.sp, @truncate(self.pc >> 8));
+                    self.tick(bus, 4);
+                    // Push PC low byte
+                    self.sp -%= 1;
+                    bus.write(self.sp, @truncate(self.pc));
+                    self.tick(bus, 4);
+                    // Jump to vector (internal cycle for PC set)
+                    self.tick(bus, 4);
+                    self.pc = switch (i) {
+                        0 => 0x40,
+                        1 => 0x48,
+                        2 => 0x50,
+                        3 => 0x58,
+                        4 => 0x60,
+                        else => unreachable,
+                    };
+                    return 20;
+                }
+            }
+            return 20;
+        }
+
+        // HALT bug handling moved into execute_instruction
+        self.ticked_cycles = 0;
+        const cycles = self.execute_instruction(bus);
+
+        // Tick any remaining internal M-cycles not covered by read_tick/write_tick
+        if (cycles > self.ticked_cycles) {
+            self.tick(bus, cycles - self.ticked_cycles);
+        }
+
+        // Handle scheduled IME enable (EI instruction) - delayed by one instruction
         if (self.ime_scheduled) {
             self.interrupt_master_enable = true;
             self.ime_scheduled = false;
-            // std.log.debug("CPU: IME enabled (scheduled)", .{});
-        }
-
-        // --- Interrupt Handling (before instruction fetch/execution) ---
-        // This is crucial for correct interrupt timing and HALT behavior.
-        // If CPU is halted and an interrupt is pending, exit HALT
-        if (self.halted) {
-            const interrupt_enable_reg = bus.read(0xFFFF);
-            const pending_interrupts = bus.interrupt_flag & interrupt_enable_reg;
-            if (pending_interrupts != 0) {
-                self.halted = false;
-            } else {
-                return 4;
-            }
-        }
-
-        const interrupt_enable_reg = bus.read(0xFFFF);
-        const pending_interrupts = bus.interrupt_flag & interrupt_enable_reg;
-        if (self.interrupt_master_enable and pending_interrupts != 0) {
-            self.handle_interrupts(bus); // This will push PC and jump to vector
-            return 20; // Cycles for interrupt handling (RST + push/pop)
-        }
-
-        // HALT bug: the instruction executes normally, but PC fails to
-        // increment — effectively the next byte is read twice.
-        const saved_pc = self.pc;
-        const halt_bug = self.halt_bug_active;
-        if (halt_bug) {
-            self.halt_bug_active = false;
-        }
-
-        const cycles = self.execute_instruction(bus);
-
-        if (halt_bug) {
-            // Undo the PC advancement so the same opcode byte is fetched again
-            self.pc = saved_pc;
         }
 
         return cycles;
     }
-    fn execute_instruction(self: *CPU, bus: *Bus) u8 {
-        const opcode = bus.read(self.pc);
-        // std.log.info("PC: 0x{x:0>4} | opcode: 0x{x:0>2}", .{ self.pc, opcode });
+
+    /// Tick timer and PPU by the given number of T-cycles
+    fn tick(self: *CPU, bus: *Bus, t_cycles: u32) void {
+        self.cycles += t_cycles;
+        self.ticked_cycles += t_cycles;
+        bus.timer.step(bus, @intCast(t_cycles));
+        bus.ppu.step(bus, @intCast(t_cycles));
+        bus.apu.step(t_cycles, bus.timer.div_counter);
+    }
+
+    /// CPU-facing read: read memory then tick 1 M-cycle
+    fn read_tick(self: *CPU, bus: *Bus, address: u16) u8 {
+        const val = bus.read(address);
+        self.tick(bus, 4);
+        return val;
+    }
+
+    /// CPU-facing write: write memory then tick 1 M-cycle
+    fn write_tick(self: *CPU, bus: *Bus, address: u16, value: u8) void {
+        bus.write(address, value);
+        self.tick(bus, 4);
+    }
+    fn execute_instruction(self: *CPU, bus: *Bus) u32 {
+        const opcode = self.read_tick(bus, self.pc);
+
+        // HALT bug: opcode fetch doesn't increment PC, so the byte after
+        // HALT is read as both opcode and first operand. We simulate this
+        // by decrementing PC after the fetch, so self.pc + 1 points to
+        // the same byte that was just fetched as the opcode.
+        if (self.halt_bug_active) {
+            self.halt_bug_active = false;
+            self.pc -%= 1;
+        }
 
         switch (opcode) {
             0x00 => { //  NOP
@@ -97,8 +148,8 @@ pub const CPU = struct {
                 return 4;
             },
             0x01 => { // LD BC, u16
-                const lsb = bus.read(self.pc + 1);
-                const msb = bus.read(self.pc + 2);
+                const lsb = self.read_tick(bus, self.pc + 1);
+                const msb = self.read_tick(bus, self.pc + 2);
                 self.c = lsb;
                 self.b = msb;
                 self.pc += 3;
@@ -106,7 +157,7 @@ pub const CPU = struct {
             },
             0x02 => { // LD (BC), A
                 const addr = self.get_bc();
-                bus.write(addr, self.a);
+                self.write_tick(bus, addr, self.a);
                 self.pc += 1;
                 return 8;
             },
@@ -142,7 +193,7 @@ pub const CPU = struct {
                 return 4;
             },
             0x06 => { // LD B, u8
-                const v = bus.read(self.pc + 1);
+                const v = self.read_tick(bus, self.pc + 1);
                 self.b = v;
                 self.pc += 2;
                 return 8;
@@ -158,11 +209,11 @@ pub const CPU = struct {
                 return 4;
             },
             0x08 => { // LD (u16), SP
-                const lsb = bus.read(self.pc + 1);
-                const msb = bus.read(self.pc + 2);
+                const lsb = self.read_tick(bus, self.pc + 1);
+                const msb = self.read_tick(bus, self.pc + 2);
                 const addr = (@as(u16, msb) << 8) | @as(u16, lsb);
-                bus.write(addr, @truncate(self.sp));
-                bus.write(addr + 1, @truncate(self.sp >> 8));
+                self.write_tick(bus, addr, @truncate(self.sp));
+                self.write_tick(bus, addr + 1, @truncate(self.sp >> 8));
                 self.pc += 3;
                 return 20;
             },
@@ -182,7 +233,7 @@ pub const CPU = struct {
             },
             0x0A => { // LD A (BC)
                 const addr = self.get_bc();
-                self.a = bus.read(addr);
+                self.a = self.read_tick(bus, addr);
                 self.pc += 1;
                 return 8;
             },
@@ -218,7 +269,7 @@ pub const CPU = struct {
                 return 4;
             },
             0x0E => { // LD C, u8
-                const v = bus.read(self.pc + 1);
+                const v = self.read_tick(bus, self.pc + 1);
                 self.c = v;
                 self.pc += 2;
                 return 8;
@@ -237,8 +288,8 @@ pub const CPU = struct {
                 return 4;
             },
             0x11 => { // LD DE, u16
-                const lsb = bus.read(self.pc + 1);
-                const msb = bus.read(self.pc + 2);
+                const lsb = self.read_tick(bus, self.pc + 1);
+                const msb = self.read_tick(bus, self.pc + 2);
                 self.e = lsb;
                 self.d = msb;
                 self.pc += 3;
@@ -246,7 +297,7 @@ pub const CPU = struct {
             },
             0x12 => { // LD (DE),A
                 const addr = self.get_de();
-                bus.write(addr, self.a);
+                self.write_tick(bus, addr, self.a);
                 self.pc += 1;
                 return 8;
             },
@@ -282,7 +333,7 @@ pub const CPU = struct {
                 return 4;
             },
             0x16 => { // LD D, u8
-                const v = bus.read(self.pc + 1);
+                const v = self.read_tick(bus, self.pc + 1);
                 self.d = v;
                 self.pc += 2;
                 return 8;
@@ -298,7 +349,7 @@ pub const CPU = struct {
                 return 4;
             },
             0x18 => { // JR i8
-                const offset = bus.read(self.pc + 1);
+                const offset = self.read_tick(bus, self.pc + 1);
                 const next_pc = self.pc + 2;
                 self.pc = @as(u16, @bitCast(@as(i16, @bitCast(next_pc)) + @as(i8, @bitCast(offset))));
                 return 12;
@@ -319,7 +370,7 @@ pub const CPU = struct {
             },
             0x1A => { // LD A, (DE)
                 const addr = @as(u16, self.d) << 8 | @as(u16, self.e);
-                self.a = bus.read(addr);
+                self.a = self.read_tick(bus, addr);
                 self.pc += 1;
                 return 8;
             },
@@ -356,7 +407,7 @@ pub const CPU = struct {
                 return 4;
             },
             0x1E => { // LD E, u8
-                const v = bus.read(self.pc + 1);
+                const v = self.read_tick(bus, self.pc + 1);
                 self.e = v;
                 self.pc += 2;
                 return 8;
@@ -372,7 +423,7 @@ pub const CPU = struct {
                 return 4;
             },
             0x20 => { //JR NZ, r8
-                const offset = bus.read(self.pc + 1);
+                const offset = self.read_tick(bus, self.pc + 1);
                 if (!self.get_zero_flag()) {
                     const next_pc = self.pc + 2;
                     self.pc = @as(u16, @bitCast(@as(i16, @bitCast(next_pc)) + @as(i8, @bitCast(offset))));
@@ -383,8 +434,8 @@ pub const CPU = struct {
                 }
             },
             0x21 => { // LD HL, u16
-                const lsb = bus.read(self.pc + 1);
-                const msb = bus.read(self.pc + 2);
+                const lsb = self.read_tick(bus, self.pc + 1);
+                const msb = self.read_tick(bus, self.pc + 2);
                 self.l = lsb;
                 self.h = msb;
                 self.pc += 3;
@@ -392,7 +443,7 @@ pub const CPU = struct {
             },
             0x22 => { // LD (HL+), A
                 var hl = self.get_hl();
-                bus.write(hl, self.a);
+                self.write_tick(bus, hl, self.a);
                 hl +%= 1;
                 self.set_hl(hl);
                 self.pc += 1;
@@ -430,7 +481,7 @@ pub const CPU = struct {
                 return 4;
             },
             0x26 => { // LD H, u8
-                const v = bus.read(self.pc + 1);
+                const v = self.read_tick(bus, self.pc + 1);
                 self.h = v;
                 self.pc += 2;
                 return 8;
@@ -473,7 +524,7 @@ pub const CPU = struct {
             },
 
             0x28 => { //JR Z, i8
-                const offset = bus.read(self.pc + 1);
+                const offset = self.read_tick(bus, self.pc + 1);
                 if (self.get_zero_flag()) {
                     const next_pc = self.pc + 2;
                     self.pc = @as(u16, @bitCast(@as(i16, @bitCast(next_pc)) + @as(i8, @bitCast(offset))));
@@ -498,7 +549,7 @@ pub const CPU = struct {
             },
             0x2A => { // LD A, (HL+)
                 var hl = self.get_hl();
-                self.a = bus.read(hl);
+                self.a = self.read_tick(bus, hl);
                 hl +%= 1;
                 self.set_hl(hl);
                 self.pc += 1;
@@ -536,7 +587,7 @@ pub const CPU = struct {
                 return 4;
             },
             0x2E => { // LD L, u8
-                const v = bus.read(self.pc + 1);
+                const v = self.read_tick(bus, self.pc + 1);
                 self.l = v;
                 self.pc += 2;
                 return 8;
@@ -550,7 +601,7 @@ pub const CPU = struct {
             },
             0x30 => { // JR NC, i8
                 // 相对PC跳转，carry 是0 则跳转
-                const offset = bus.read(self.pc + 1);
+                const offset = self.read_tick(bus, self.pc + 1);
                 if ((self.f & C_FLAG) == 0) {
                     const next_pc = self.pc + 2;
                     self.pc = @as(u16, @bitCast(@as(i16, @bitCast(next_pc)) + @as(i8, @bitCast(offset))));
@@ -561,8 +612,8 @@ pub const CPU = struct {
                 }
             },
             0x31 => { // LD SP, u16
-                const lsb = bus.read(self.pc + 1);
-                const msb = bus.read(self.pc + 2);
+                const lsb = self.read_tick(bus, self.pc + 1);
+                const msb = self.read_tick(bus, self.pc + 2);
                 const imm_v = @as(u16, lsb) | (@as(u16, msb) << 8);
                 self.sp = imm_v;
                 self.pc += 3;
@@ -570,7 +621,7 @@ pub const CPU = struct {
             },
             0x32 => { // LD (HL-), A
                 var hl = self.get_hl();
-                bus.write(hl, self.a);
+                self.write_tick(bus, hl, self.a);
                 hl -%= 1;
                 self.set_hl(hl);
                 self.pc += 1;
@@ -583,11 +634,11 @@ pub const CPU = struct {
             },
             0x34 => { //INC (HL)
                 const addr = self.get_hl();
-                const original_val = bus.read(addr);
+                const original_val = self.read_tick(bus, addr);
                 const c_flag_preserved = self.f & C_FLAG;
 
                 const new_val = original_val +% 1;
-                bus.write(addr, new_val);
+                self.write_tick(bus, addr, new_val);
 
                 self.f = 0;
                 self.set_zero_flag(new_val == 0);
@@ -599,9 +650,9 @@ pub const CPU = struct {
             },
             0x35 => { // DEC (HL)
                 const addr = self.get_hl();
-                const orignal_val = bus.read(addr);
+                const orignal_val = self.read_tick(bus, addr);
                 const new_val = orignal_val -% 1;
-                bus.write(addr, new_val);
+                self.write_tick(bus, addr, new_val);
                 const c_flag_preserved = self.f & C_FLAG;
                 self.f = 0;
                 self.set_zero_flag(new_val == 0);
@@ -612,9 +663,9 @@ pub const CPU = struct {
                 return 12;
             },
             0x36 => { // LD (HL), u8
-                const val = bus.read(self.pc + 1);
+                const val = self.read_tick(bus, self.pc + 1);
                 const addr = self.get_hl();
-                bus.write(addr, val);
+                self.write_tick(bus, addr, val);
                 self.pc += 2;
                 return 12;
             },
@@ -629,7 +680,7 @@ pub const CPU = struct {
                 return 4;
             },
             0x38 => { // JR C, i8
-                const offset = bus.read(self.pc + 1);
+                const offset = self.read_tick(bus, self.pc + 1);
                 if ((self.f & C_FLAG) != 0) {
                     const next_pc = self.pc + 2;
                     self.pc = @as(u16, @bitCast(@as(i16, @bitCast(next_pc)) + @as(i8, @bitCast(offset))));
@@ -655,7 +706,7 @@ pub const CPU = struct {
             },
             0x3A => { //LD A, (HL-)
                 var hl = self.get_hl();
-                self.a = bus.read(hl);
+                self.a = self.read_tick(bus, hl);
                 hl -%= 1;
                 self.set_hl(hl);
                 self.pc += 1;
@@ -691,7 +742,7 @@ pub const CPU = struct {
                 return 4;
             },
             0x3E => { // LD A, u8
-                const v = bus.read(self.pc + 1);
+                const v = self.read_tick(bus, self.pc + 1);
                 self.a = v;
                 self.pc += 2;
                 return 8;
@@ -738,7 +789,7 @@ pub const CPU = struct {
             },
             0x46 => { // LD B, (HL)
                 const addr = self.get_hl();
-                self.b = bus.read(addr);
+                self.b = self.read_tick(bus, addr);
                 self.pc += 1;
                 return 8;
             },
@@ -778,7 +829,7 @@ pub const CPU = struct {
             },
             0x4E => { // LD C,(HL)
                 const addr = self.get_hl();
-                self.c = bus.read(addr);
+                self.c = self.read_tick(bus, addr);
                 self.pc += 1;
                 return 8;
             },
@@ -818,7 +869,7 @@ pub const CPU = struct {
             },
             0x56 => { // LD D, (HL)
                 const addr = self.get_hl();
-                self.d = bus.read(addr);
+                self.d = self.read_tick(bus, addr);
                 self.pc += 1;
                 return 8;
             },
@@ -858,7 +909,7 @@ pub const CPU = struct {
             },
             0x5E => { // LD E, (HL)
                 const addr = self.get_hl();
-                self.e = bus.read(addr);
+                self.e = self.read_tick(bus, addr);
                 self.pc += 1;
                 return 8;
             },
@@ -898,7 +949,7 @@ pub const CPU = struct {
             },
             0x66 => { // LD H, (HL)
                 const addr = self.get_hl();
-                self.h = bus.read(addr);
+                self.h = self.read_tick(bus, addr);
                 self.pc += 1;
                 return 8;
             },
@@ -938,7 +989,7 @@ pub const CPU = struct {
             },
             0x6E => { // LD L, (HL)
                 const addr = self.get_hl();
-                self.l = bus.read(addr);
+                self.l = self.read_tick(bus, addr);
                 self.pc += 1;
                 return 8;
             },
@@ -949,50 +1000,58 @@ pub const CPU = struct {
             },
             0x70 => { //LD (HL), B
                 const addr = self.get_hl();
-                bus.write(addr, self.b);
+                self.write_tick(bus, addr, self.b);
                 self.pc += 1;
                 return 8;
             },
             0x71 => { // LD (HL), C
                 const addr = self.get_hl();
-                bus.write(addr, self.c);
+                self.write_tick(bus, addr, self.c);
                 self.pc += 1;
                 return 8;
             },
             0x72 => { // LD (HL), D
                 const addr = self.get_hl();
-                bus.write(addr, self.d);
+                self.write_tick(bus, addr, self.d);
                 self.pc += 1;
                 return 8;
             },
             0x73 => { // LD (HL), E
                 const addr = self.get_hl();
-                bus.write(addr, self.e);
+                self.write_tick(bus, addr, self.e);
                 self.pc += 1;
                 return 8;
             },
             0x74 => { // LD (HL), H
                 const addr = self.get_hl();
-                bus.write(addr, self.h);
+                self.write_tick(bus, addr, self.h);
                 self.pc += 1;
                 return 8;
             },
             0x75 => { // LD (HL), L
                 const addr = self.get_hl();
-                bus.write(addr, self.l);
+                self.write_tick(bus, addr, self.l);
                 self.pc += 1;
                 return 8;
             },
             0x76 => { // HALT
-                const ie = bus.read(0xFFFF);
-                const pending = bus.interrupt_flag & ie;
-                if (!self.interrupt_master_enable and pending != 0) {
-                    // HALT bug: IME is off but there's a pending interrupt.
-                    // CPU does NOT halt; instead the next instruction's PC
-                    // increment is skipped (the byte after HALT is read twice).
-                    self.halt_bug_active = true;
-                    self.pc += 1;
+                // Check pending interrupts (matching SameBoy behavior)
+                const pending_h = bus.interrupt_flag & bus.interrupt_enable_register;
+                if (pending_h != 0) {
+                    if (self.interrupt_master_enable) {
+                        // IME=1 + pending: don't actually halt.
+                        // PC stays on HALT so interrupt dispatch pushes
+                        // HALT's address; RETI will re-execute HALT.
+                        self.halted = false;
+                    } else {
+                        // IME=0 + pending: HALT bug — next opcode fetch
+                        // fails to increment PC.
+                        self.halt_bug_active = true;
+                        self.pc += 1;
+                    }
                 } else {
+                    // No pending interrupt: enter halt, wait for any
+                    // interrupt to become pending.
                     self.halted = true;
                     self.pc += 1;
                 }
@@ -1000,7 +1059,7 @@ pub const CPU = struct {
             },
             0x77 => { // LD (HL), A
                 const hl = self.get_hl();
-                bus.write(hl, self.a);
+                self.write_tick(bus, hl, self.a);
                 self.pc += 1;
                 return 8;
             },
@@ -1036,7 +1095,7 @@ pub const CPU = struct {
             },
             0x7E => { // LD A, (HL)
                 const addr = self.get_hl();
-                self.a = bus.read(addr);
+                self.a = self.read_tick(bus, addr);
                 self.pc += 1;
                 return 8;
             },
@@ -1124,7 +1183,7 @@ pub const CPU = struct {
             0x86 => { // ADD A, (HL)
                 const orignal_a = self.a;
                 const addr = self.get_hl();
-                const val = bus.read(addr);
+                const val = self.read_tick(bus, addr);
                 const res: u16 = @as(u16, orignal_a) + @as(u16, val);
                 self.a = @truncate(res);
                 self.f = 0;
@@ -1235,7 +1294,7 @@ pub const CPU = struct {
             },
             0x8E => { // ADC A, (HL)
                 const original_a = self.a;
-                const val = bus.read(self.get_hl());
+                const val = self.read_tick(bus, self.get_hl());
                 const carry_in: u8 = if (self.get_carry_flag()) 1 else 0;
                 const res = @as(u16, original_a) + @as(u16, val) + @as(u16, carry_in);
                 self.a = @truncate(res);
@@ -1335,7 +1394,7 @@ pub const CPU = struct {
             },
             0x96 => { // SUB A, (HL)
                 const original_a = self.a;
-                const val = bus.read(self.get_hl());
+                const val = self.read_tick(bus, self.get_hl());
                 self.a -%= val;
                 self.f = 0;
                 self.set_zero_flag(self.a == 0);
@@ -1443,7 +1502,7 @@ pub const CPU = struct {
             },
             0x9E => { // SBC A,(HL)
                 const orignal_a = self.a;
-                const val = bus.read(self.get_hl());
+                const val = self.read_tick(bus, self.get_hl());
                 const carry: u8 = if (self.get_carry_flag()) 1 else 0;
                 const result = @as(u16, orignal_a) -% @as(u16, val) -% @as(u16, carry);
                 self.a = @truncate(result);
@@ -1531,7 +1590,7 @@ pub const CPU = struct {
             },
             0xA6 => {
                 const addr = self.get_hl();
-                self.a &= bus.read(addr);
+                self.a &= self.read_tick(bus, addr);
                 self.f = 0;
                 self.set_zero_flag(self.a == 0);
                 self.set_substract_flag(false);
@@ -1612,7 +1671,7 @@ pub const CPU = struct {
             },
             0xAE => { // XOR A, (HL)
                 const addr = self.get_hl();
-                self.a ^= bus.read(addr);
+                self.a ^= self.read_tick(bus, addr);
                 self.f = 0;
                 self.set_zero_flag(self.a == 0);
                 self.set_carry_flag(false);
@@ -1693,7 +1752,7 @@ pub const CPU = struct {
             },
             0xB6 => { // OR A, (HL)
                 const addr = self.get_hl();
-                const val = bus.read(addr);
+                const val = self.read_tick(bus, addr);
                 self.a |= val;
                 self.f = 0;
                 self.set_zero_flag(self.a == 0);
@@ -1775,7 +1834,7 @@ pub const CPU = struct {
             },
             0xBE => { // CP A, (HL)
                 const addr = self.get_hl();
-                const val = bus.read(addr);
+                const val = self.read_tick(bus, addr);
                 const original_a = self.a;
                 self.f = 0;
                 self.set_zero_flag(original_a == val);
@@ -1798,9 +1857,9 @@ pub const CPU = struct {
             },
             0xC0 => { // RET NZ
                 if (!self.get_zero_flag()) {
-                    const low = bus.read(self.sp);
+                    const low = self.read_tick(bus, self.sp);
                     self.sp +%= 1;
-                    const high = bus.read(self.sp);
+                    const high = self.read_tick(bus, self.sp);
                     self.sp +%= 1;
                     self.pc = (@as(u16, high) << 8) | @as(u16, low);
                     return 20;
@@ -1810,16 +1869,16 @@ pub const CPU = struct {
                 }
             },
             0xC1 => { // POP BC
-                self.c = bus.read(self.sp);
+                self.c = self.read_tick(bus, self.sp);
                 self.sp +%= 1;
-                self.b = bus.read(self.sp);
+                self.b = self.read_tick(bus, self.sp);
                 self.sp +%= 1;
                 self.pc += 1;
                 return 12;
             },
             0xC2 => { // JP NZ, u16
-                const low = bus.read(self.pc + 1);
-                const high = bus.read(self.pc + 2);
+                const low = self.read_tick(bus, self.pc + 1);
+                const high = self.read_tick(bus, self.pc + 2);
 
                 if (!self.get_zero_flag()) {
                     const addr = (@as(u16, high) << 8) | @as(u16, low);
@@ -1831,20 +1890,20 @@ pub const CPU = struct {
                 }
             },
             0xC3 => { // JP u16
-                const lo = bus.read(self.pc + 1);
-                const hi = bus.read(self.pc + 2);
+                const lo = self.read_tick(bus, self.pc + 1);
+                const hi = self.read_tick(bus, self.pc + 2);
                 self.pc = @as(u16, lo) | (@as(u16, hi) << 8);
                 return 16;
             },
             0xC4 => { // CALL NZ, u16
-                const lo = bus.read(self.pc + 1);
-                const hi = bus.read(self.pc + 2);
+                const lo = self.read_tick(bus, self.pc + 1);
+                const hi = self.read_tick(bus, self.pc + 2);
                 if (!self.get_zero_flag()) {
                     const ret_addr = self.pc + 3;
                     self.sp -%= 1;
-                    bus.write(self.sp, @truncate(ret_addr >> 8));
+                    self.write_tick(bus, self.sp, @truncate(ret_addr >> 8));
                     self.sp -%= 1;
-                    bus.write(self.sp, @truncate(ret_addr));
+                    self.write_tick(bus, self.sp, @truncate(ret_addr));
                     self.pc = @as(u16, hi) << 8 | lo;
                     return 24;
                 } else {
@@ -1854,14 +1913,14 @@ pub const CPU = struct {
             },
             0xC5 => { // PUSH BC
                 self.sp -%= 1;
-                bus.write(self.sp, self.b);
+                self.write_tick(bus, self.sp, self.b);
                 self.sp -%= 1;
-                bus.write(self.sp, self.c);
+                self.write_tick(bus, self.sp, self.c);
                 self.pc += 1;
                 return 16;
             },
             0xC6 => { // ADD A, u8
-                const val = bus.read(self.pc + 1);
+                const val = self.read_tick(bus, self.pc + 1);
                 const original_a = self.a;
                 const res = @as(u16, original_a) + @as(u16, val);
                 self.f = 0;
@@ -1878,17 +1937,17 @@ pub const CPU = struct {
                 const pc_hi: u8 = @truncate(ret_addr >> 8);
                 const pc_lo: u8 = @truncate(ret_addr);
                 self.sp -%= 1;
-                bus.write(self.sp, pc_hi);
+                self.write_tick(bus, self.sp, pc_hi);
                 self.sp -%= 1;
-                bus.write(self.sp, pc_lo);
+                self.write_tick(bus, self.sp, pc_lo);
                 self.pc = 0x0000;
                 return 16;
             },
             0xC8 => { // RET Z
                 if (self.get_zero_flag()) {
-                    const lo = bus.read(self.sp);
+                    const lo = self.read_tick(bus, self.sp);
                     self.sp +%= 1;
-                    const hi = bus.read(self.sp);
+                    const hi = self.read_tick(bus, self.sp);
                     self.sp +%= 1;
                     self.pc = (@as(u16, hi) << 8) | @as(u16, lo);
                     return 20;
@@ -1898,9 +1957,9 @@ pub const CPU = struct {
                 }
             },
             0xC9 => { // RET
-                const low = bus.read(self.sp);
+                const low = self.read_tick(bus, self.sp);
                 self.sp +%= 1;
-                const hi = bus.read(self.sp);
+                const hi = self.read_tick(bus, self.sp);
                 self.sp +%= 1;
                 self.pc = (@as(u16, hi) << 8) | @as(u16, low);
                 return 16;
@@ -1916,7 +1975,7 @@ pub const CPU = struct {
                 }
             },
             0xCB => { // CB prefix instructions
-                const cb_opcode = bus.read(self.pc + 1);
+                const cb_opcode = self.read_tick(bus, self.pc + 1);
                 self.pc += 2;
                 switch (cb_opcode) {
                     0x00 => { // RLC B
@@ -1981,11 +2040,11 @@ pub const CPU = struct {
                     },
                     0x06 => { // RLC (HL)
                         const addr = self.get_hl();
-                        const original_value = bus.read(addr);
+                        const original_value = self.read_tick(bus, addr);
                         self.f = 0;
                         self.set_carry_flag((original_value & 0x80) != 0);
                         const new_value = (original_value << 1) | @as(u8, @intFromBool(self.get_carry_flag()));
-                        bus.write(addr, new_value);
+                        self.write_tick(bus, addr, new_value);
                         self.set_zero_flag(new_value == 0);
                         self.set_substract_flag(false);
                         self.set_half_carry_flag(false);
@@ -2063,11 +2122,11 @@ pub const CPU = struct {
                     },
                     0x0E => { // RRC (HL)
                         const addr = self.get_hl();
-                        const original_value = bus.read(addr);
+                        const original_value = self.read_tick(bus, addr);
                         self.f = 0;
                         self.set_carry_flag((original_value & 0x01) != 0);
                         const new_value = (original_value >> 1) | @as(u8, @intFromBool(self.get_carry_flag())) << 7;
-                        bus.write(addr, new_value);
+                        self.write_tick(bus, addr, new_value);
                         self.set_zero_flag(new_value == 0);
                         self.set_substract_flag(false);
                         self.set_half_carry_flag(false);
@@ -2151,12 +2210,12 @@ pub const CPU = struct {
                     },
                     0x16 => { // RL (HL)
                         const addr = self.get_hl();
-                        const original_value = bus.read(addr);
+                        const original_value = self.read_tick(bus, addr);
                         const carry_in: u8 = if (self.get_carry_flag()) 1 else 0;
                         self.f = 0;
                         self.set_carry_flag((original_value & 0x80) != 0);
                         const new_value = (original_value << 1) | carry_in;
-                        bus.write(addr, new_value);
+                        self.write_tick(bus, addr, new_value);
                         self.set_zero_flag(new_value == 0);
                         self.set_substract_flag(false);
                         self.set_half_carry_flag(false);
@@ -2241,12 +2300,12 @@ pub const CPU = struct {
                     },
                     0x1E => { // RR (HL)
                         const addr = self.get_hl();
-                        const original_value = bus.read(addr);
+                        const original_value = self.read_tick(bus, addr);
                         const carry_in: u8 = if (self.get_carry_flag()) 1 else 0;
                         self.f = 0;
                         self.set_carry_flag((original_value & 0x01) != 0);
                         const new_value = original_value >> 1 | (carry_in << 7);
-                        bus.write(addr, new_value);
+                        self.write_tick(bus, addr, new_value);
                         self.set_zero_flag(new_value == 0);
                         self.set_substract_flag(false);
                         self.set_half_carry_flag(false);
@@ -2326,11 +2385,11 @@ pub const CPU = struct {
                     },
                     0x26 => { // SLA (HL)
                         const addr = self.get_hl();
-                        const original_val = bus.read(addr);
+                        const original_val = self.read_tick(bus, addr);
                         self.f = 0;
                         self.set_carry_flag((original_val & 0x80) != 0);
                         const new_val = original_val << 1;
-                        bus.write(addr, new_val);
+                        self.write_tick(bus, addr, new_val);
                         self.set_zero_flag(new_val == 0);
                         self.set_substract_flag(false);
                         self.set_half_carry_flag(false);
@@ -2408,11 +2467,11 @@ pub const CPU = struct {
                     },
                     0x2E => { // SRA (HL)
                         const addr = self.get_hl();
-                        const original_val = bus.read(addr);
+                        const original_val = self.read_tick(bus, addr);
                         self.f = 0;
                         self.set_carry_flag((original_val & 0x01) != 0);
                         const new_val = (original_val >> 1) | (original_val & 0x80);
-                        bus.write(addr, new_val);
+                        self.write_tick(bus, addr, new_val);
                         self.set_zero_flag(new_val == 0);
                         self.set_substract_flag(false);
                         self.set_half_carry_flag(false);
@@ -2490,9 +2549,9 @@ pub const CPU = struct {
                     },
                     0x36 => { // SWAP (HL)
                         const addr = self.get_hl();
-                        const original_val = bus.read(addr);
+                        const original_val = self.read_tick(bus, addr);
                         const new_val = (original_val << 4) | (original_val >> 4);
-                        bus.write(addr, new_val);
+                        self.write_tick(bus, addr, new_val);
                         self.f = 0;
                         self.set_zero_flag(new_val == 0);
                         self.set_substract_flag(false);
@@ -2572,11 +2631,11 @@ pub const CPU = struct {
                     },
                     0x3E => { // SRL (HL)
                         const addr = self.get_hl();
-                        const original_val = bus.read(addr);
+                        const original_val = self.read_tick(bus, addr);
                         self.f = 0;
                         self.set_carry_flag((original_val & 0x01) != 0);
                         const new_val = original_val >> 1;
-                        bus.write(addr, new_val);
+                        self.write_tick(bus, addr, new_val);
                         self.set_zero_flag(new_val == 0);
                         self.set_substract_flag(false);
                         self.set_half_carry_flag(false);
@@ -2649,7 +2708,7 @@ pub const CPU = struct {
                     0x46 => { // BIT 0, (HL)
                         const c_flag_preserved = self.f & C_FLAG;
                         self.f = 0;
-                        self.set_zero_flag((bus.read(self.get_hl()) & (1 << 0)) == 0);
+                        self.set_zero_flag((self.read_tick(bus, self.get_hl()) & (1 << 0)) == 0);
                         self.set_substract_flag(false);
                         self.set_half_carry_flag(true);
                         self.f |= c_flag_preserved;
@@ -2721,7 +2780,7 @@ pub const CPU = struct {
                     0x4E => { // BIT 1, (HL)
                         const c_flag_preserved = self.f & C_FLAG;
                         self.f = 0;
-                        self.set_zero_flag((bus.read(self.get_hl()) & (1 << 1)) == 0);
+                        self.set_zero_flag((self.read_tick(bus, self.get_hl()) & (1 << 1)) == 0);
                         self.set_substract_flag(false);
                         self.set_half_carry_flag(true);
                         self.f |= c_flag_preserved;
@@ -2793,7 +2852,7 @@ pub const CPU = struct {
                     0x56 => { // BIT 2, (HL)
                         const c_flag_preserved = self.f & C_FLAG;
                         self.f = 0;
-                        self.set_zero_flag((bus.read(self.get_hl()) & (1 << 2)) == 0);
+                        self.set_zero_flag((self.read_tick(bus, self.get_hl()) & (1 << 2)) == 0);
                         self.set_substract_flag(false);
                         self.set_half_carry_flag(true);
                         self.f |= c_flag_preserved;
@@ -2869,7 +2928,7 @@ pub const CPU = struct {
                     0x5E => { // BIT 3, (HL)
                         const c_flag_preserved = self.f & C_FLAG;
                         self.f = 0;
-                        self.set_zero_flag((bus.read(self.get_hl()) & (1 << 3)) == 0);
+                        self.set_zero_flag((self.read_tick(bus, self.get_hl()) & (1 << 3)) == 0);
                         self.set_substract_flag(false);
                         self.set_half_carry_flag(true);
                         self.f |= c_flag_preserved;
@@ -2948,7 +3007,7 @@ pub const CPU = struct {
                     0x66 => { // BIT 4, (HL)
                         const c_flag_preserved = self.f & C_FLAG;
                         self.f = 0;
-                        self.set_zero_flag((bus.read(self.get_hl()) & (1 << 4)) == 0);
+                        self.set_zero_flag((self.read_tick(bus, self.get_hl()) & (1 << 4)) == 0);
                         self.set_substract_flag(false);
                         self.set_half_carry_flag(true);
                         self.f |= c_flag_preserved;
@@ -3025,7 +3084,7 @@ pub const CPU = struct {
                     0x6E => { // BIT 5, (HL)
                         const c_flag_preserved = self.f & C_FLAG;
                         self.f = 0;
-                        self.set_zero_flag((bus.read(self.get_hl()) & (1 << 5)) == 0);
+                        self.set_zero_flag((self.read_tick(bus, self.get_hl()) & (1 << 5)) == 0);
                         self.set_substract_flag(false);
                         self.set_half_carry_flag(true);
                         self.f |= c_flag_preserved;
@@ -3102,7 +3161,7 @@ pub const CPU = struct {
                     0x76 => { // BIT 6, (HL)
                         const c_flag_preserved = self.f & C_FLAG;
                         self.f = 0;
-                        self.set_zero_flag((bus.read(self.get_hl()) & (1 << 6)) == 0);
+                        self.set_zero_flag((self.read_tick(bus, self.get_hl()) & (1 << 6)) == 0);
                         self.set_substract_flag(false);
                         self.set_half_carry_flag(true);
                         self.f |= c_flag_preserved;
@@ -3182,7 +3241,7 @@ pub const CPU = struct {
                     0x7E => { // BIT 7, (HL)
                         const c_flag_preserved = self.f & C_FLAG;
                         self.f = 0;
-                        self.set_zero_flag((bus.read(self.get_hl()) & (1 << 7)) == 0);
+                        self.set_zero_flag((self.read_tick(bus, self.get_hl()) & (1 << 7)) == 0);
                         self.set_substract_flag(false);
                         self.set_half_carry_flag(true);
                         self.f |= c_flag_preserved;
@@ -3225,7 +3284,7 @@ pub const CPU = struct {
                         return 8;
                     },
                     0x86 => { // RES 0, (HL)
-                        bus.write(self.get_hl(), bus.read(self.get_hl()) & ~@as(u8, 1 << 0));
+                        self.write_tick(bus, self.get_hl(), self.read_tick(bus, self.get_hl()) & ~@as(u8, 1 << 0));
                         return 16;
                     },
                     0x87 => { // RES 0, A
@@ -3258,7 +3317,7 @@ pub const CPU = struct {
                         return 8;
                     },
                     0x8E => { // RES 1, (HL)
-                        bus.write(self.get_hl(), bus.read(self.get_hl()) & ~@as(u8, 1 << 1));
+                        self.write_tick(bus, self.get_hl(), self.read_tick(bus, self.get_hl()) & ~@as(u8, 1 << 1));
                         return 16;
                     },
                     0x8F => { // RES 1, A
@@ -3291,7 +3350,7 @@ pub const CPU = struct {
                         return 8;
                     },
                     0x96 => { // RES 2, (HL)
-                        bus.write(self.get_hl(), bus.read(self.get_hl()) & ~@as(u8, 1 << 2));
+                        self.write_tick(bus, self.get_hl(), self.read_tick(bus, self.get_hl()) & ~@as(u8, 1 << 2));
                         return 16;
                     },
                     0x97 => { // RES 2, A
@@ -3323,7 +3382,7 @@ pub const CPU = struct {
                         return 8;
                     },
                     0x9E => { // RES 3, (HL)
-                        bus.write(self.get_hl(), bus.read(self.get_hl()) & ~@as(u8, 1 << 3));
+                        self.write_tick(bus, self.get_hl(), self.read_tick(bus, self.get_hl()) & ~@as(u8, 1 << 3));
                         return 16;
                     },
                     0x9F => { // RES 3, A
@@ -3355,7 +3414,7 @@ pub const CPU = struct {
                         return 8;
                     },
                     0xA6 => { // RES 4, (HL)
-                        bus.write(self.get_hl(), bus.read(self.get_hl()) & ~@as(u8, 1 << 4));
+                        self.write_tick(bus, self.get_hl(), self.read_tick(bus, self.get_hl()) & ~@as(u8, 1 << 4));
                         return 16;
                     },
                     0xA7 => { // RES 4, A
@@ -3387,7 +3446,7 @@ pub const CPU = struct {
                         return 8;
                     },
                     0xAE => { // RES 5, (HL)
-                        bus.write(self.get_hl(), bus.read(self.get_hl()) & ~@as(u8, 1 << 5));
+                        self.write_tick(bus, self.get_hl(), self.read_tick(bus, self.get_hl()) & ~@as(u8, 1 << 5));
                         return 16;
                     },
                     0xAF => { // RES 5, A
@@ -3419,7 +3478,7 @@ pub const CPU = struct {
                         return 8;
                     },
                     0xB6 => { // RES 6, (HL)
-                        bus.write(self.get_hl(), bus.read(self.get_hl()) & ~@as(u8, 1 << 6));
+                        self.write_tick(bus, self.get_hl(), self.read_tick(bus, self.get_hl()) & ~@as(u8, 1 << 6));
                         return 16;
                     },
                     0xB7 => { // RES 6, A
@@ -3452,7 +3511,7 @@ pub const CPU = struct {
                     },
 
                     0xBE => { // RES 7, (HL)
-                        bus.write(self.get_hl(), bus.read(self.get_hl()) & ~@as(u8, 1 << 7));
+                        self.write_tick(bus, self.get_hl(), self.read_tick(bus, self.get_hl()) & ~@as(u8, 1 << 7));
                         return 16;
                     },
                     0xBF => { // RES 7, A
@@ -3485,7 +3544,7 @@ pub const CPU = struct {
                         return 8;
                     },
                     0xC6 => { // SET 0, (HL)
-                        bus.write(self.get_hl(), bus.read(self.get_hl()) | @as(u8, 1 << 0));
+                        self.write_tick(bus, self.get_hl(), self.read_tick(bus, self.get_hl()) | @as(u8, 1 << 0));
                         return 16;
                     },
                     0xC7 => { // SET 0, A
@@ -3517,7 +3576,7 @@ pub const CPU = struct {
                         return 8;
                     },
                     0xCE => { // SET 1, (HL)
-                        bus.write(self.get_hl(), bus.read(self.get_hl()) | @as(u8, 1 << 1));
+                        self.write_tick(bus, self.get_hl(), self.read_tick(bus, self.get_hl()) | @as(u8, 1 << 1));
                         return 16;
                     },
                     0xCF => { // SET 1, A
@@ -3549,7 +3608,7 @@ pub const CPU = struct {
                         return 8;
                     },
                     0xD6 => { // SET 2, (HL)
-                        bus.write(self.get_hl(), bus.read(self.get_hl()) | @as(u8, 1 << 2));
+                        self.write_tick(bus, self.get_hl(), self.read_tick(bus, self.get_hl()) | @as(u8, 1 << 2));
                         return 16;
                     },
                     0xD7 => { // SET 2, A
@@ -3581,7 +3640,7 @@ pub const CPU = struct {
                         return 8;
                     },
                     0xDE => { // SET 3, (HL)
-                        bus.write(self.get_hl(), bus.read(self.get_hl()) | @as(u8, 1 << 3));
+                        self.write_tick(bus, self.get_hl(), self.read_tick(bus, self.get_hl()) | @as(u8, 1 << 3));
                         return 16;
                     },
                     0xDF => { // SET 3, A
@@ -3614,7 +3673,7 @@ pub const CPU = struct {
                         return 8;
                     },
                     0xE6 => { // SET 4, (HL)
-                        bus.write(self.get_hl(), bus.read(self.get_hl()) | @as(u8, 1 << 4));
+                        self.write_tick(bus, self.get_hl(), self.read_tick(bus, self.get_hl()) | @as(u8, 1 << 4));
                         return 16;
                     },
                     0xE7 => { // SET 4, A
@@ -3646,7 +3705,7 @@ pub const CPU = struct {
                         return 8;
                     },
                     0xEE => { // SET 5, (HL)
-                        bus.write(self.get_hl(), bus.read(self.get_hl()) | @as(u8, 1 << 5));
+                        self.write_tick(bus, self.get_hl(), self.read_tick(bus, self.get_hl()) | @as(u8, 1 << 5));
                         return 16;
                     },
                     0xEF => { // SET 5, A
@@ -3678,7 +3737,7 @@ pub const CPU = struct {
                         return 8;
                     },
                     0xF6 => { // SET 6, (HL)
-                        bus.write(self.get_hl(), bus.read(self.get_hl()) | @as(u8, 1 << 6));
+                        self.write_tick(bus, self.get_hl(), self.read_tick(bus, self.get_hl()) | @as(u8, 1 << 6));
                         return 16;
                     },
                     0xF7 => { // SET 6, A
@@ -3710,7 +3769,7 @@ pub const CPU = struct {
                         return 8;
                     },
                     0xFE => { // SET 7, (HL)
-                        bus.write(self.get_hl(), bus.read(self.get_hl()) | @as(u8, 1 << 7));
+                        self.write_tick(bus, self.get_hl(), self.read_tick(bus, self.get_hl()) | @as(u8, 1 << 7));
                         return 16;
                     },
                     0xFF => { // SET 7, A
@@ -3724,16 +3783,16 @@ pub const CPU = struct {
                 }
             },
             0xCC => { // CALL Z, u16
-                const addr_lo: u8 = bus.read(self.pc + 1);
-                const addr_hi: u8 = bus.read(self.pc + 2);
+                const addr_lo: u8 = self.read_tick(bus, self.pc + 1);
+                const addr_hi: u8 = self.read_tick(bus, self.pc + 2);
                 const target_addr: u16 = (@as(u16, addr_hi) << 8) | addr_lo;
                 self.pc += 3;
 
                 if (self.get_zero_flag()) {
                     self.sp -%= 1;
-                    bus.write(self.sp, @truncate(self.pc >> 8));
+                    self.write_tick(bus, self.sp, @truncate(self.pc >> 8));
                     self.sp -%= 1;
-                    bus.write(self.sp, @truncate(self.pc));
+                    self.write_tick(bus, self.sp, @truncate(self.pc));
                     self.pc = target_addr;
                     return 24;
                 }
@@ -3741,19 +3800,19 @@ pub const CPU = struct {
                 return 12;
             },
             0xCD => { // CALL u16
-                const low = bus.read(self.pc + 1);
-                const high = bus.read(self.pc + 2);
+                const low = self.read_tick(bus, self.pc + 1);
+                const high = self.read_tick(bus, self.pc + 2);
                 const target_addr = (@as(u16, high) << 8) | @as(u16, low);
                 const return_addr = self.pc + 3;
                 self.sp -%= 1;
-                bus.write(self.sp, @truncate(return_addr >> 8));
+                self.write_tick(bus, self.sp, @truncate(return_addr >> 8));
                 self.sp -%= 1;
-                bus.write(self.sp, @truncate(return_addr));
+                self.write_tick(bus, self.sp, @truncate(return_addr));
                 self.pc = target_addr;
                 return 24;
             },
             0xCE => { // ADC A, u8
-                const val = bus.read(self.pc + 1);
+                const val = self.read_tick(bus, self.pc + 1);
                 const orignal_a = self.a;
                 const carry_in: u8 = if ((self.f & C_FLAG) != 0) 1 else 0;
                 const result = @as(u16, orignal_a) + @as(u16, val) + @as(u16, carry_in);
@@ -3771,17 +3830,17 @@ pub const CPU = struct {
                 const pc_hi: u8 = @truncate(ret_addr >> 8);
                 const pc_lo: u8 = @truncate(ret_addr);
                 self.sp -%= 1;
-                bus.write(self.sp, pc_hi);
+                self.write_tick(bus, self.sp, pc_hi);
                 self.sp -%= 1;
-                bus.write(self.sp, pc_lo);
+                self.write_tick(bus, self.sp, pc_lo);
                 self.pc = 0x0008;
                 return 16;
             },
             0xD0 => { // RET NC
                 if ((self.f & C_FLAG) == 0) {
-                    const low = bus.read(self.sp);
+                    const low = self.read_tick(bus, self.sp);
                     self.sp +%= 1;
-                    const high = bus.read(self.sp);
+                    const high = self.read_tick(bus, self.sp);
                     self.sp +%= 1;
                     self.pc = (@as(u16, high) << 8) | @as(u16, low);
                     return 20;
@@ -3791,9 +3850,9 @@ pub const CPU = struct {
                 }
             },
             0xD1 => { // POP DE
-                const lo = bus.read(self.sp);
+                const lo = self.read_tick(bus, self.sp);
                 self.sp +%= 1;
-                const hi = bus.read(self.sp);
+                const hi = self.read_tick(bus, self.sp);
                 self.sp +%= 1;
                 self.e = lo;
                 self.d = hi;
@@ -3801,8 +3860,8 @@ pub const CPU = struct {
                 return 12;
             },
             0xD2 => { // JP NC, u16
-                const low = bus.read(self.pc + 1);
-                const high = bus.read(self.pc + 2);
+                const low = self.read_tick(bus, self.pc + 1);
+                const high = self.read_tick(bus, self.pc + 2);
 
                 if ((self.f & C_FLAG) == 0) {
                     const addr = (@as(u16, high) << 8) | @as(u16, low);
@@ -3818,14 +3877,14 @@ pub const CPU = struct {
                 unreachable;
             },
             0xD4 => { // CALL NC, u16
-                const low = bus.read(self.pc + 1);
-                const high = bus.read(self.pc + 2);
+                const low = self.read_tick(bus, self.pc + 1);
+                const high = self.read_tick(bus, self.pc + 2);
                 if ((self.f & C_FLAG) == 0) {
                     const ret_addr = self.pc + 3;
                     self.sp -%= 1;
-                    bus.write(self.sp, @truncate(ret_addr >> 8));
+                    self.write_tick(bus, self.sp, @truncate(ret_addr >> 8));
                     self.sp -%= 1;
-                    bus.write(self.sp, @truncate(ret_addr));
+                    self.write_tick(bus, self.sp, @truncate(ret_addr));
                     self.pc = (@as(u16, high) << 8) | @as(u16, low);
                     return 24;
                 } else {
@@ -3835,14 +3894,14 @@ pub const CPU = struct {
             },
             0xD5 => { // PUSH DE
                 self.sp -%= 1;
-                bus.write(self.sp, self.d);
+                self.write_tick(bus, self.sp, self.d);
                 self.sp -%= 1;
-                bus.write(self.sp, self.e);
+                self.write_tick(bus, self.sp, self.e);
                 self.pc += 1;
                 return 16;
             },
             0xD6 => { // SUB A, u8
-                const val = bus.read(self.pc + 1);
+                const val = self.read_tick(bus, self.pc + 1);
                 const original_a = self.a;
                 self.a -%= val;
                 self.f = 0;
@@ -3858,17 +3917,17 @@ pub const CPU = struct {
                 const pc_hi: u8 = @truncate(ret_addr >> 8);
                 const pc_lo: u8 = @truncate(ret_addr);
                 self.sp -%= 1;
-                bus.write(self.sp, pc_hi);
+                self.write_tick(bus, self.sp, pc_hi);
                 self.sp -%= 1;
-                bus.write(self.sp, pc_lo);
+                self.write_tick(bus, self.sp, pc_lo);
                 self.pc = 0x0010;
                 return 16;
             },
             0xD8 => { //RET C
                 if ((self.f & C_FLAG) != 0) {
-                    const lo = bus.read(self.sp);
+                    const lo = self.read_tick(bus, self.sp);
                     self.sp +%= 1;
-                    const hi = bus.read(self.sp);
+                    const hi = self.read_tick(bus, self.sp);
                     self.sp +%= 1;
                     self.pc = (@as(u16, hi) << 8) | @as(u16, lo);
                     return 20;
@@ -3878,17 +3937,17 @@ pub const CPU = struct {
                 }
             },
             0xD9 => { // RETI
-                const low = bus.read(self.sp);
+                const low = self.read_tick(bus, self.sp);
                 self.sp +%= 1;
-                const high = bus.read(self.sp);
+                const high = self.read_tick(bus, self.sp);
                 self.sp +%= 1;
                 self.pc = (@as(u16, high) << 8) | @as(u16, low);
                 self.interrupt_master_enable = true; // Enable interrupts after RETI
                 return 16;
             },
             0xDA => { // JP C, u16
-                const low = bus.read(self.pc + 1);
-                const high = bus.read(self.pc + 2);
+                const low = self.read_tick(bus, self.pc + 1);
+                const high = self.read_tick(bus, self.pc + 2);
 
                 if ((self.f & C_FLAG) != 0) {
                     const addr = (@as(u16, high) << 8) | @as(u16, low);
@@ -3900,14 +3959,14 @@ pub const CPU = struct {
                 }
             },
             0xDC => { // CALL C, u16
-                const low = bus.read(self.pc + 1);
-                const high = bus.read(self.pc + 2);
+                const low = self.read_tick(bus, self.pc + 1);
+                const high = self.read_tick(bus, self.pc + 2);
                 if ((self.f & C_FLAG) != 0) {
                     const ret_addr = self.pc + 3;
                     self.sp -%= 1;
-                    bus.write(self.sp, @truncate(ret_addr >> 8));
+                    self.write_tick(bus, self.sp, @truncate(ret_addr >> 8));
                     self.sp -%= 1;
-                    bus.write(self.sp, @truncate(ret_addr));
+                    self.write_tick(bus, self.sp, @truncate(ret_addr));
                     self.pc = (@as(u16, high) << 8) | @as(u16, low);
                     return 24;
                 } else {
@@ -3916,7 +3975,7 @@ pub const CPU = struct {
                 }
             },
             0xDE => { //SBC A,u8
-                const val = bus.read(self.pc + 1);
+                const val = self.read_tick(bus, self.pc + 1);
                 const carry: u8 = if ((self.f & C_FLAG) != 0) 1 else 0;
                 const a = self.a;
                 const res = a -% val -% carry;
@@ -3934,44 +3993,44 @@ pub const CPU = struct {
                 const pc_hi: u8 = @truncate(ret_addr >> 8);
                 const pc_lo: u8 = @truncate(ret_addr);
                 self.sp -%= 1;
-                bus.write(self.sp, pc_hi);
+                self.write_tick(bus, self.sp, pc_hi);
                 self.sp -%= 1;
-                bus.write(self.sp, pc_lo);
+                self.write_tick(bus, self.sp, pc_lo);
                 self.pc = 0x0018;
                 return 16;
             },
             0xE0 => { // LD (FF00+U8), A
-                const offset = bus.read(self.pc + 1);
+                const offset = self.read_tick(bus, self.pc + 1);
                 const target_addr = 0xFF00 + @as(u16, offset);
-                bus.write(target_addr, self.a);
+                self.write_tick(bus, target_addr, self.a);
                 self.pc += 2;
                 return 12;
             },
             0xE1 => { // POP HL
-                self.l = bus.read(self.sp);
+                self.l = self.read_tick(bus, self.sp);
                 self.sp +%= 1;
-                self.h = bus.read(self.sp);
+                self.h = self.read_tick(bus, self.sp);
                 self.sp +%= 1;
                 self.pc += 1;
                 return 12;
             },
             0xE2 => { // LD (FF00 +C), A
                 const addr = 0xFF00 + @as(u16, self.c);
-                bus.write(addr, self.a);
+                self.write_tick(bus, addr, self.a);
                 self.pc += 1;
                 return 8;
             },
 
             0xE5 => { // PUSH HL
                 self.sp -%= 1;
-                bus.write(self.sp, self.h);
+                self.write_tick(bus, self.sp, self.h);
                 self.sp -%= 1;
-                bus.write(self.sp, self.l);
+                self.write_tick(bus, self.sp, self.l);
                 self.pc += 1;
                 return 16;
             },
             0xE6 => { // AND A, u8
-                const val = bus.read(self.pc + 1);
+                const val = self.read_tick(bus, self.pc + 1);
                 self.a &= val;
                 self.f = 0;
                 self.set_zero_flag(self.a == 0);
@@ -3986,14 +4045,14 @@ pub const CPU = struct {
                 const pc_hi: u8 = @truncate(ret_addr >> 8);
                 const pc_lo: u8 = @truncate(ret_addr);
                 self.sp -%= 1;
-                bus.write(self.sp, pc_hi);
+                self.write_tick(bus, self.sp, pc_hi);
                 self.sp -%= 1;
-                bus.write(self.sp, pc_lo);
+                self.write_tick(bus, self.sp, pc_lo);
                 self.pc = 0x0020;
                 return 16;
             },
             0xE8 => { // ADD SP, i8
-                const imm_u8 = bus.read(self.pc + 1);
+                const imm_u8 = self.read_tick(bus, self.pc + 1);
                 const imm_i8: i8 = @bitCast(imm_u8);
                 const original_sp = self.sp;
 
@@ -4022,15 +4081,15 @@ pub const CPU = struct {
                 return 4;
             },
             0xEA => { // LD (nn), A
-                const addr_low = bus.read(self.pc + 1);
-                const addr_high = bus.read(self.pc + 2);
+                const addr_low = self.read_tick(bus, self.pc + 1);
+                const addr_high = self.read_tick(bus, self.pc + 2);
                 const composite_addr = @as(u16, addr_high) << 8 | addr_low;
-                bus.write(composite_addr, self.a);
+                self.write_tick(bus, composite_addr, self.a);
                 self.pc += 3;
                 return 16;
             },
             0xEE => { // XOR A, u8
-                const val = bus.read(self.pc + 1);
+                const val = self.read_tick(bus, self.pc + 1);
                 self.a ^= val;
                 self.f = 0;
                 self.set_zero_flag(self.a == 0);
@@ -4045,31 +4104,31 @@ pub const CPU = struct {
                 const pc_hi: u8 = @truncate(ret_addr >> 8);
                 const pc_lo: u8 = @truncate(ret_addr);
                 self.sp -%= 1;
-                bus.write(self.sp, pc_hi);
+                self.write_tick(bus, self.sp, pc_hi);
                 self.sp -%= 1;
-                bus.write(self.sp, pc_lo);
+                self.write_tick(bus, self.sp, pc_lo);
                 self.pc = 0x0028;
                 return 16;
             },
             0xF0 => { // LD A, (FF00 + u8)
-                const offset = bus.read(self.pc + 1);
+                const offset = self.read_tick(bus, self.pc + 1);
                 const target_addr = 0xFF00 + @as(u16, offset);
-                self.a = bus.read(target_addr);
+                self.a = self.read_tick(bus, target_addr);
                 self.pc += 2;
                 return 12;
             },
             0xF1 => { // POP AF
-                const val = bus.read(self.sp);
+                const val = self.read_tick(bus, self.sp);
                 self.f = val & 0xF0; // lower 4 bits of F are always 0
                 self.sp +%= 1;
-                self.a = bus.read(self.sp);
+                self.a = self.read_tick(bus, self.sp);
                 self.sp +%= 1;
                 self.pc += 1;
                 return 12;
             },
             0xF2 => { // LD A, (FF00 + C)
                 const addr = 0xFF00 + @as(u16, self.c);
-                self.a = bus.read(addr);
+                self.a = self.read_tick(bus, addr);
                 self.pc += 1;
                 return 8;
             },
@@ -4081,14 +4140,14 @@ pub const CPU = struct {
             },
             0xF5 => { // PUSH AF
                 self.sp -%= 1;
-                bus.write(self.sp, self.a);
+                self.write_tick(bus, self.sp, self.a);
                 self.sp -%= 1;
-                bus.write(self.sp, self.f);
+                self.write_tick(bus, self.sp, self.f);
                 self.pc += 1;
                 return 16;
             },
             0xF6 => { // OR A, u8
-                const val = bus.read(self.pc + 1);
+                const val = self.read_tick(bus, self.pc + 1);
                 self.a |= val;
                 self.f = 0;
                 self.set_zero_flag(self.a == 0);
@@ -4103,14 +4162,14 @@ pub const CPU = struct {
                 const pc_hi: u8 = @truncate(ret_addr >> 8);
                 const pc_lo: u8 = @truncate(ret_addr);
                 self.sp -%= 1;
-                bus.write(self.sp, pc_hi);
+                self.write_tick(bus, self.sp, pc_hi);
                 self.sp -%= 1;
-                bus.write(self.sp, pc_lo);
+                self.write_tick(bus, self.sp, pc_lo);
                 self.pc = 0x0030;
                 return 16;
             },
             0xF8 => { // LD HL, SP+i8
-                const offset: i8 = @bitCast(bus.read(self.pc + 1));
+                const offset: i8 = @bitCast(self.read_tick(bus, self.pc + 1));
                 const sp = self.sp;
                 const res = @as(u16, @bitCast(@as(i16, @bitCast(sp)) +% offset));
                 self.set_hl(res);
@@ -4127,10 +4186,10 @@ pub const CPU = struct {
                 return 8;
             },
             0xFA => { // LD A, (nn)
-                const lsb = bus.read(self.pc + 1);
-                const msb = bus.read(self.pc + 2);
+                const lsb = self.read_tick(bus, self.pc + 1);
+                const msb = self.read_tick(bus, self.pc + 2);
                 const imm_v = @as(u16, lsb) | (@as(u16, msb) << 8);
-                self.a = bus.read(imm_v);
+                self.a = self.read_tick(bus, imm_v);
                 self.pc += 3;
                 return 16;
             },
@@ -4140,7 +4199,7 @@ pub const CPU = struct {
                 return 4;
             },
             0xFE => { // CP A, u8
-                const imm_v = bus.read(self.pc + 1);
+                const imm_v = self.read_tick(bus, self.pc + 1);
                 self.f = 0;
                 self.set_zero_flag(self.a == imm_v);
                 self.set_substract_flag(true);
@@ -4154,9 +4213,9 @@ pub const CPU = struct {
                 const pc_hi: u8 = @truncate(ret_addr >> 8);
                 const pc_lo: u8 = @truncate(ret_addr);
                 self.sp -%= 1;
-                bus.write(self.sp, pc_hi);
+                self.write_tick(bus, self.sp, pc_hi);
                 self.sp -%= 1;
-                bus.write(self.sp, pc_lo);
+                self.write_tick(bus, self.sp, pc_lo);
                 self.pc = 0x0038;
                 return 16;
             },
@@ -4193,9 +4252,9 @@ pub const CPU = struct {
     pub fn get_zero_flag(self: *const CPU) bool {
         return self.f & Z_FLAG != 0;
     }
-    fn read_u16(self: *const CPU, bus: *Bus) u16 {
-        const lo = bus.read(self.pc + 1);
-        const hi = bus.read(self.pc + 2);
+    fn read_u16(self: *CPU, bus: *Bus) u16 {
+        const lo = self.read_tick(bus, self.pc + 1);
+        const hi = self.read_tick(bus, self.pc + 2);
         return (@as(u16, hi) << 8) | @as(u16, lo);
     }
     fn get_hl(self: *const CPU) u16 {
