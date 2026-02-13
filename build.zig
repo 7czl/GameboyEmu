@@ -39,6 +39,10 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // Link SDL2 for display backend
+    exe_mod.linkSystemLibrary("SDL2", .{});
+    exe_mod.linkSystemLibrary("c", .{});
+
     // Modules can depend on one another using the `std.Build.Module.addImport` function.
     // This is what allows Zig source code to use `@import("foo")` where 'foo' is not a
     // file path. In this case, we set up `exe_mod` to import `lib_mod`.
