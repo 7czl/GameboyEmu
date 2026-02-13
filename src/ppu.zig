@@ -40,6 +40,8 @@ pub const Ppu = struct {
     // Internal window line counter
     window_line_counter: u8 = 0,
     window_was_active: bool = false,
+    // STAT interrupt line state for rising-edge detection (STAT blocking)
+    stat_irq_line: bool = false,
 
     pub fn init() Ppu {
         return Ppu{};
@@ -53,42 +55,47 @@ pub const Ppu = struct {
         self.stat &= 0xF8;
         self.window_line_counter = 0;
         self.window_was_active = false;
+        self.stat_irq_line = false;
     }
 
-    fn set_mode(self: *Ppu, bus: *Bus) void {
-        const old_mode = self.stat & 0x3;
-        const new_mode = @intFromEnum(self.mode);
-        self.stat = (self.stat & 0xFC) | new_mode;
+    /// Evaluate the STAT interrupt line and fire on rising edge.
+    /// The various STAT sources are ORed together; an interrupt is
+    /// requested only on a low-to-high transition (STAT blocking).
+    fn update_stat_irq(self: *Ppu, bus: *Bus) void {
+        const mode_val = @intFromEnum(self.mode);
+        var line = false;
 
-        if (old_mode == new_mode) return;
+        // Mode 0 (HBlank) interrupt source
+        if ((self.stat & 0x08 != 0) and mode_val == 0) line = true;
+        // Mode 1 (VBlank) interrupt source
+        if ((self.stat & 0x10 != 0) and mode_val == 1) line = true;
+        // Mode 2 (OAM Scan) interrupt source
+        if ((self.stat & 0x20 != 0) and mode_val == 2) line = true;
+        // LYC=LY interrupt source
+        if ((self.stat & 0x40 != 0) and (self.stat & 0x04 != 0)) line = true;
 
-        var request_interrupt = false;
-        switch (self.mode) {
-            .HBlank => {
-                if (self.stat & 0x08 != 0) request_interrupt = true;
-            },
-            .VBlank => {
-                if (self.stat & 0x10 != 0) request_interrupt = true;
-            },
-            .OAMScan => {
-                if (self.stat & 0x20 != 0) request_interrupt = true;
-            },
-            .Drawing => {},
-        }
-        if (request_interrupt) {
+        // Rising edge detection
+        if (line and !self.stat_irq_line) {
             bus.request_interrupt(.LCD_STAT);
         }
+        self.stat_irq_line = line;
     }
 
+    /// Update mode bits in STAT register
+    fn set_mode(self: *Ppu, bus: *Bus) void {
+        const new_mode = @intFromEnum(self.mode);
+        self.stat = (self.stat & 0xFC) | new_mode;
+        self.update_stat_irq(bus);
+    }
+
+    /// Check LY=LYC coincidence flag and update STAT interrupt line
     fn check_lyc(self: *Ppu, bus: *Bus) void {
         if (self.ly == self.lyc) {
             self.stat |= 0x04;
-            if (self.stat & 0x40 != 0) {
-                bus.request_interrupt(.LCD_STAT);
-            }
         } else {
             self.stat &= ~@as(u8, 0x04);
         }
+        self.update_stat_irq(bus);
     }
 
     /// Resolve a 2-bit color index through a palette register
@@ -209,7 +216,7 @@ pub const Ppu = struct {
         if (self.lcdc & 0x02 == 0) return;
 
         const tall_sprites = (self.lcdc & 0x04) != 0; // 8x16 mode
-        const sprite_height: u8 = if (tall_sprites) 16 else 8;
+        const sprite_height: i16 = if (tall_sprites) 16 else 8;
 
         // Collect sprites on this scanline (max 10)
         var sprite_indices: [10]u8 = undefined;
@@ -245,10 +252,12 @@ pub const Ppu = struct {
 
             if (tall_sprites) tile_id &= 0xFE;
 
-            var line: u16 = @intCast(@as(i16, self.ly) - sprite_y);
+            var line: i16 = @as(i16, self.ly) - sprite_y;
+            if (line < 0 or line >= sprite_height) continue;
             if (y_flip) line = sprite_height - 1 - line;
 
-            const tile_addr: u16 = 0x8000 + @as(u16, tile_id) * 16 + line * 2;
+            const line_u16: u16 = @intCast(line);
+            const tile_addr: u16 = 0x8000 + @as(u16, tile_id) * 16 + line_u16 * 2;
             const lo = bus.read(tile_addr);
             const hi = bus.read(tile_addr + 1);
 
@@ -271,10 +280,11 @@ pub const Ppu = struct {
                 // BG priority: if set, sprite is behind non-zero BG colors
                 if (bg_priority) {
                     const sx: u32 = @intCast(screen_x);
-                    const existing = display.framebuffer[
-                        @as(u32, self.ly) * 160 + sx
-                    ];
-                    if (existing != palette_color(self.bgp, 0)) continue;
+                    const fb_idx = @as(u32, self.ly) * 160 + sx;
+                    if (fb_idx < display.framebuffer.len) {
+                        const existing = display.framebuffer[fb_idx];
+                        if (existing != palette_color(self.bgp, 0)) continue;
+                    }
                 }
 
                 display.set_pixel(
@@ -319,16 +329,21 @@ pub const Ppu = struct {
                 if (self.cycle_counter >= 204) {
                     self.cycle_counter -= 204;
                     self.ly += 1;
-                    self.check_lyc(bus);
 
                     if (self.ly == 144) {
                         self.mode = .VBlank;
-                        self.set_mode(bus);
+                        // VBlank interrupt is separate from STAT
                         bus.request_interrupt(.VBlank);
+                        self.set_mode(bus);
+                        // Check LYC after mode change so both can contribute
+                        self.check_lyc(bus);
                         // Present the frame
                         if (self.display) |d| d.update();
                     } else {
                         self.mode = .OAMScan;
+                        // Check LYC before set_mode so LYC coincidence flag
+                        // is set when OAM mode evaluates the STAT line
+                        self.check_lyc(bus);
                         self.set_mode(bus);
                     }
                 }
@@ -339,12 +354,14 @@ pub const Ppu = struct {
                     self.ly += 1;
                     if (self.ly > 153) {
                         self.ly = 0;
-                        self.mode = .OAMScan;
-                        self.set_mode(bus);
                         self.window_line_counter = 0;
                         self.window_was_active = false;
+                        self.mode = .OAMScan;
+                        self.check_lyc(bus);
+                        self.set_mode(bus);
+                    } else {
+                        self.check_lyc(bus);
                     }
-                    self.check_lyc(bus);
                 }
             },
         }

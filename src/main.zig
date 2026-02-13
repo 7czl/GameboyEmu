@@ -20,10 +20,31 @@ pub fn main() !void {
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
 
-    const rom_path = if (args.len > 1) args[1] else "roms/tetris.gb";
-    std.log.info("Loading ROM from: {s}", .{rom_path});
+    // Parse arguments
+    var rom_path: []const u8 = "roms/tetris.gb";
+    var boot_rom_path: []const u8 = "dmg_boot.bin";
+    var headless = false;
+    var max_cycles: u64 = 0; // 0 = unlimited
 
-    const boot_rom_path = if (args.len > 2) args[2] else "dmg_boot.bin";
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "--headless")) {
+            headless = true;
+        } else if (std.mem.eql(u8, args[i], "--max-cycles")) {
+            i += 1;
+            if (i < args.len) {
+                max_cycles = std.fmt.parseInt(u64, args[i], 10) catch 0;
+            }
+        } else if (std.mem.eql(u8, args[i], "--boot-rom")) {
+            i += 1;
+            if (i < args.len) boot_rom_path = args[i];
+        } else {
+            rom_path = args[i];
+        }
+    }
+
+    std.log.info("Loading ROM from: {s}", .{rom_path});
+    if (headless) std.log.info("Running in headless mode", .{});
 
     var file = try std.fs.cwd().openFile(rom_path, .{ .mode = .read_only });
     defer file.close();
@@ -52,6 +73,52 @@ pub fn main() !void {
     }
     defer if (boot_rom_allocated) allocator.free(boot_rom_bytes);
 
+    // Initialize emulator components
+    var display = Display.init();
+    var ppu = Ppu.init();
+    ppu.display = &display;
+    var timer = Timer.init();
+    var joypad = Joypad.init();
+    var bus = Bus.init(rom_bytes, boot_rom_bytes, &timer, &ppu, &joypad);
+    var cpu = Cpu.init();
+
+    if (skip_boot_rom) {
+        bus.boot_rom_active = false;
+        cpu.a = 0x01;
+        cpu.f = 0xB0;
+        cpu.b = 0x00;
+        cpu.c = 0x13;
+        cpu.d = 0x00;
+        cpu.e = 0xD8;
+        cpu.h = 0x01;
+        cpu.l = 0x4D;
+        cpu.sp = 0xFFFE;
+        cpu.pc = 0x0100;
+        ppu.enabled = true;
+    }
+
+    if (headless) {
+        return run_headless(&cpu, &bus, &timer, &ppu, max_cycles);
+    } else {
+        return run_with_sdl(&cpu, &bus, &timer, &ppu, &display, &joypad);
+    }
+}
+
+/// Headless mode: run without SDL, output serial to stdout, exit after max_cycles
+fn run_headless(cpu: *Cpu, bus: *Bus, timer: *Timer, ppu: *Ppu, max_cycles: u64) void {
+    std.log.info("--- start emulation loop (headless) ---", .{});
+    var total_cycles: u64 = 0;
+
+    while (max_cycles == 0 or total_cycles < max_cycles) {
+        const cycles = cpu.step(bus);
+        timer.step(bus, @intCast(cycles));
+        ppu.step(bus, @intCast(cycles));
+        total_cycles += cycles;
+    }
+}
+
+/// SDL mode: run with display window and input handling
+fn run_with_sdl(cpu: *Cpu, bus: *Bus, timer: *Timer, ppu: *Ppu, display: *Display, joypad: *Joypad) !void {
     // Initialize SDL
     if (c.SDL_Init(c.SDL_INIT_VIDEO) != 0) {
         std.log.err("SDL_Init failed: {s}", .{c.SDL_GetError()});
@@ -85,30 +152,6 @@ pub fn main() !void {
     ) orelse return error.SDLTextureFailed;
     defer c.SDL_DestroyTexture(texture);
 
-    // Initialize emulator components
-    var display = Display.init();
-    var ppu = Ppu.init();
-    ppu.display = &display;
-    var timer = Timer.init();
-    var joypad = Joypad.init();
-    var bus = Bus.init(rom_bytes, boot_rom_bytes, &timer, &ppu, &joypad);
-    var cpu = Cpu.init();
-
-    if (skip_boot_rom) {
-        bus.boot_rom_active = false;
-        cpu.a = 0x01;
-        cpu.f = 0xB0;
-        cpu.b = 0x00;
-        cpu.c = 0x13;
-        cpu.d = 0x00;
-        cpu.e = 0xD8;
-        cpu.h = 0x01;
-        cpu.l = 0x4D;
-        cpu.sp = 0xFFFE;
-        cpu.pc = 0x0100;
-        ppu.enabled = true;
-    }
-
     std.log.info("--- start emulation loop ---", .{});
 
     const cycles_per_frame: u32 = 70224;
@@ -134,9 +177,9 @@ pub fn main() !void {
         // Run one frame
         var frame_cycles: u32 = 0;
         while (frame_cycles < cycles_per_frame) {
-            const cycles = cpu.step(&bus);
-            timer.step(&bus, @intCast(cycles));
-            ppu.step(&bus, @intCast(cycles));
+            const cycles = cpu.step(bus);
+            timer.step(bus, @intCast(cycles));
+            ppu.step(bus, @intCast(cycles));
             frame_cycles += cycles;
         }
 
