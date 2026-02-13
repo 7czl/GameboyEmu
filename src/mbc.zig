@@ -69,6 +69,50 @@ pub const Mbc = union(MbcType) {
             .mbc5 => |*m| m.write_ram(address, value),
         }
     }
+
+    /// Check if cartridge has battery-backed RAM (needs save file)
+    pub fn has_battery(cart_type: u8) bool {
+        return switch (cart_type) {
+            0x03 => true, // MBC1+RAM+BATTERY
+            0x06 => true, // MBC2+BATTERY
+            0x09 => true, // ROM+RAM+BATTERY
+            0x0D => true, // MMM01+RAM+BATTERY
+            0x0F, 0x10, 0x13 => true, // MBC3+TIMER+BATTERY, MBC3+TIMER+RAM+BATTERY, MBC3+RAM+BATTERY
+            0x1B, 0x1E => true, // MBC5+RAM+BATTERY, MBC5+RUMBLE+RAM+BATTERY
+            0x22 => true, // MBC7+SENSOR+RUMBLE+RAM+BATTERY
+            0xFF => true, // HuC1+RAM+BATTERY
+            else => false,
+        };
+    }
+
+    /// Get a slice of the entire RAM for saving
+    pub fn get_ram_data(self: *Mbc) ?[]const u8 {
+        return switch (self.*) {
+            .none => null,
+            .mbc1 => |*m| &m.ram,
+            .mbc3 => |*m| &m.ram,
+            .mbc5 => |*m| &m.ram,
+        };
+    }
+
+    /// Load RAM data from a save file
+    pub fn load_ram_data(self: *Mbc, data: []const u8) void {
+        switch (self.*) {
+            .none => {},
+            .mbc1 => |*m| {
+                const len = @min(data.len, m.ram.len);
+                @memcpy(m.ram[0..len], data[0..len]);
+            },
+            .mbc3 => |*m| {
+                const len = @min(data.len, m.ram.len);
+                @memcpy(m.ram[0..len], data[0..len]);
+            },
+            .mbc5 => |*m| {
+                const len = @min(data.len, m.ram.len);
+                @memcpy(m.ram[0..len], data[0..len]);
+            },
+        }
+    }
 };
 
 // ============================================================
@@ -115,9 +159,7 @@ const Mbc1 = struct {
             },
             0x4000...0x7FFF => {
                 var bank: u32 = self.rom_bank;
-                if (self.banking_mode == 0) {
-                    bank |= @as(u32, self.ram_bank) << 5;
-                }
+                bank |= @as(u32, self.ram_bank) << 5;
                 bank %= self.rom_bank_count;
                 const offset = bank * 0x4000 + (address - 0x4000);
                 if (offset < rom.len) return rom[offset];
