@@ -285,6 +285,18 @@ pub const CPU = struct {
             },
             0x10 => { // STOP
                 self.pc += 2; // 注意这里是2
+                // CGB: if speed switch is armed, toggle double speed
+                if (bus.cgb_mode and bus.speed_switch_armed) {
+                    bus.double_speed = !bus.double_speed;
+                    bus.speed_switch_armed = false;
+                    // Speed switch takes ~8200 T-cycles, tick 4 at a time
+                    var remaining: u32 = 8200;
+                    while (remaining >= 4) {
+                        self.tick(bus, 4);
+                        remaining -= 4;
+                    }
+                    return 8204;
+                }
                 return 4;
             },
             0x11 => { // LD DE, u16

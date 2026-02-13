@@ -123,15 +123,27 @@ pub fn main() !void {
 
     if (skip_boot_rom) {
         bus.boot_rom_active = false;
-        // CPU registers (DMG post-boot values from pandocs)
-        cpu.a = 0x01;
-        cpu.f = 0xB0;
-        cpu.b = 0x00;
-        cpu.c = 0x13;
-        cpu.d = 0x00;
-        cpu.e = 0xD8;
-        cpu.h = 0x01;
-        cpu.l = 0x4D;
+        if (bus.cgb_mode) {
+            // CGB post-boot register values
+            cpu.a = 0x11;
+            cpu.f = 0x80;
+            cpu.b = 0x00;
+            cpu.c = 0x00;
+            cpu.d = 0xFF;
+            cpu.e = 0x56;
+            cpu.h = 0x00;
+            cpu.l = 0x0D;
+        } else {
+            // DMG post-boot values from pandocs
+            cpu.a = 0x01;
+            cpu.f = 0xB0;
+            cpu.b = 0x00;
+            cpu.c = 0x13;
+            cpu.d = 0x00;
+            cpu.e = 0xD8;
+            cpu.h = 0x01;
+            cpu.l = 0x4D;
+        }
         cpu.sp = 0xFFFE;
         cpu.pc = 0x0100;
         // IO registers (DMG post-boot values from pandocs)
