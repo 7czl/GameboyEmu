@@ -1,33 +1,78 @@
-// PPU (Pixel Processing Unit) with scanline rendering
-// Renders BG, Window, and Sprites to a 160x144 framebuffer
+// PPU (Pixel Processing Unit) with pixel FIFO rendering
 // Supports both DMG and CGB modes
-
 const Bus = @import("bus.zig").Bus;
 const Display = @import("display.zig").Display;
 const std = @import("std");
-
 pub const PpuMode = enum(u8) {
     HBlank = 0,
     VBlank = 1,
     OAMScan = 2,
     Drawing = 3,
 };
-
-// DMG palette: white, light gray, dark gray, black (ARGB8888)
 const DMG_COLORS = [4]u32{
-    0xFF_E0_F8_D0, // lightest (greenish white)
-    0xFF_88_C0_70, // light
-    0xFF_34_68_56, // dark
-    0xFF_08_18_20, // darkest
+    0xFF_E0_F8_D0,
+    0xFF_88_C0_70,
+    0xFF_34_68_56,
+    0xFF_08_18_20,
 };
-
+const FifoPixel = struct {
+    color: u2 = 0,
+    palette: u3 = 0,
+    bg_priority: bool = false,
+    is_sprite: bool = false,
+    sprite_dmg_palette: u8 = 0,
+};
+const PixelFifo = struct {
+    pixels: [16]FifoPixel = @splat(FifoPixel{}),
+    head: u4 = 0,
+    count: u4 = 0,
+    fn push(self: *PixelFifo, p: FifoPixel) void {
+        if (self.count >= 15) return;
+        const idx = (self.head +% self.count) & 0xF;
+        self.pixels[idx] = p;
+        self.count += 1;
+    }
+    fn pop(self: *PixelFifo) FifoPixel {
+        const p = self.pixels[self.head];
+        self.head = (self.head +% 1) & 0xF;
+        self.count -= 1;
+        return p;
+    }
+    fn clear(self: *PixelFifo) void {
+        self.head = 0;
+        self.count = 0;
+    }
+    fn len(self: *const PixelFifo) u4 {
+        return self.count;
+    }
+    fn overlay_at(self: *PixelFifo, pos: u4, sp: FifoPixel) void {
+        const idx = (self.head +% pos) & 0xF;
+        const existing = self.pixels[idx];
+        if (existing.is_sprite) return;
+        if (sp.color == 0) return;
+        if (sp.bg_priority and existing.color != 0) return;
+        self.pixels[idx] = sp;
+    }
+};
+const OamEntry = struct {
+    y: i16,
+    x: i16,
+    tile: u8,
+    attrs: u8,
+    oam_index: u8,
+};
+const FetcherState = enum {
+    read_tile_id,
+    read_tile_data_lo,
+    read_tile_data_hi,
+    push,
+};
 pub const Ppu = struct {
     ly: u8 = 0,
     cycle_counter: u16 = 0,
     enabled: bool = false,
     mode: PpuMode = .OAMScan,
     display: ?*Display = null,
-    // Registers
     lcdc: u8 = 0x91,
     stat: u8 = 0,
     scy: u8 = 0,
@@ -38,20 +83,33 @@ pub const Ppu = struct {
     obp1: u8 = 0xFF,
     wy: u8 = 0,
     wx: u8 = 0,
-    // Internal window line counter
     window_line_counter: u8 = 0,
     window_was_active: bool = false,
-    // STAT interrupt line state for rising-edge detection (STAT blocking)
     stat_irq_line: bool = false,
-    // Per-pixel BG color index buffer for sprite priority (CGB BG-to-OBJ priority)
-    bg_color_indices: [160]u8 = .{0} ** 160,
-    // Per-pixel BG priority from tile attribute (CGB bit 7)
-    bg_priority_flags: [160]bool = .{false} ** 160,
-
+    bg_fifo: PixelFifo = .{},
+    pixels_pushed: u8 = 0,
+    fetcher_x: u8 = 0,
+    fetcher_state: FetcherState = .read_tile_id,
+    fetcher_ticks: u8 = 0,
+    fetch_tile_id: u8 = 0,
+    fetch_tile_lo: u8 = 0,
+    fetch_tile_hi: u8 = 0,
+    fetch_tile_attrs: u8 = 0,
+    scx_discard: u8 = 0,
+    in_window: bool = false,
+    window_triggered: bool = false,
+    initial_fetch_done: bool = false,
+    wy_latch: bool = false,
+    scanline_sprites: [10]OamEntry = undefined,
+    sprite_count: u8 = 0,
+    sprite_fetch_active: bool = false,
+    sprite_fetch_idx: u8 = 0,
+    sprite_fetch_ticks: u8 = 0,
+    sprite_tile_lo: u8 = 0,
+    sprite_tile_hi: u8 = 0,
     pub fn init() Ppu {
         return Ppu{};
     }
-
     pub fn reset(self: *Ppu) void {
         self.ly = 0;
         self.cycle_counter = 0;
@@ -61,9 +119,8 @@ pub const Ppu = struct {
         self.window_line_counter = 0;
         self.window_was_active = false;
         self.stat_irq_line = false;
+        self.wy_latch = false;
     }
-
-    /// Evaluate the STAT interrupt line and fire on rising edge.
     pub fn update_stat_irq(self: *Ppu, bus: *Bus) void {
         const mode_val = @intFromEnum(self.mode);
         var line = false;
@@ -71,18 +128,13 @@ pub const Ppu = struct {
         if ((self.stat & 0x10 != 0) and mode_val == 1) line = true;
         if ((self.stat & 0x20 != 0) and mode_val == 2) line = true;
         if ((self.stat & 0x40 != 0) and (self.stat & 0x04 != 0)) line = true;
-        if (line and !self.stat_irq_line) {
-            bus.request_interrupt(.LCD_STAT);
-        }
+        if (line and !self.stat_irq_line) bus.request_interrupt(.LCD_STAT);
         self.stat_irq_line = line;
     }
-
     fn set_mode(self: *Ppu, bus: *Bus) void {
-        const new_mode = @intFromEnum(self.mode);
-        self.stat = (self.stat & 0xFC) | new_mode;
+        self.stat = (self.stat & 0xFC) | @intFromEnum(self.mode);
         self.update_stat_irq(bus);
     }
-
     fn check_lyc(self: *Ppu, bus: *Bus) void {
         if (self.ly == self.lyc) {
             self.stat |= 0x04;
@@ -91,355 +143,370 @@ pub const Ppu = struct {
         }
         self.update_stat_irq(bus);
     }
-
-    /// Resolve a 2-bit color index through a DMG palette register
     fn palette_color(palette: u8, color_id: u2) u32 {
         const shade: u2 = @truncate((palette >> (@as(u3, color_id) * 2)) & 0x03);
         return DMG_COLORS[shade];
     }
-
-    /// Convert CGB RGB555 to ARGB8888
     fn rgb555_to_argb(color_lo: u8, color_hi: u8) u32 {
         const raw = @as(u16, color_lo) | (@as(u16, color_hi) << 8);
         const r5: u8 = @truncate(raw & 0x1F);
         const g5: u8 = @truncate((raw >> 5) & 0x1F);
         const b5: u8 = @truncate((raw >> 10) & 0x1F);
-        // Accurate color correction: (x << 3) | (x >> 2)
-        const r8 = (r5 << 3) | (r5 >> 2);
-        const g8 = (g5 << 3) | (g5 >> 2);
-        const b8 = (b5 << 3) | (b5 >> 2);
-        return (@as(u32, 0xFF) << 24) | (@as(u32, r8) << 16) | (@as(u32, g8) << 8) | @as(u32, b8);
+        return (@as(u32, 0xFF) << 24) | (@as(u32, (r5 << 3) | (r5 >> 2)) << 16) |
+            (@as(u32, (g5 << 3) | (g5 >> 2)) << 8) | @as(u32, (b5 << 3) | (b5 >> 2));
     }
-
-    /// Get CGB palette color from CRAM
     fn cgb_palette_color(cram: *const [64]u8, palette_num: u3, color_id: u2) u32 {
         const offset = @as(u8, palette_num) * 8 + @as(u8, color_id) * 2;
         return rgb555_to_argb(cram[offset], cram[offset + 1]);
     }
-
-    /// Direct VRAM read from bank 0 (default)
-    fn vram_read(bus: *Bus, address: u16) u8 {
-        return bus.vram[0][address - 0x8000];
-    }
-
-    /// Direct VRAM read from specific bank
-    fn vram_bank_read(bus: *Bus, bank: u1, address: u16) u8 {
-        return bus.vram[bank][address - 0x8000];
-    }
-
-    /// Render one scanline of the background layer
-    fn render_bg_scanline(self: *Ppu, bus: *Bus) void {
-        const display = self.display orelse return;
-        const cgb = bus.cgb_mode;
-
-        if (!cgb and self.lcdc & 0x01 == 0) {
-            // DMG: BG disabled — fill with color 0
-            const color = DMG_COLORS[0];
-            for (0..160) |x| {
-                display.set_pixel(@intCast(x), self.ly, color);
-                self.bg_color_indices[x] = 0;
-                self.bg_priority_flags[x] = false;
-            }
-            return;
-        }
-
-        const tile_map_base: u16 = if (self.lcdc & 0x08 != 0) 0x9C00 else 0x9800;
-        const tile_data_unsigned = (self.lcdc & 0x10) != 0;
-        const y = @as(u16, self.ly) +% @as(u16, self.scy);
-
-        for (0..160) |screen_x| {
-            const x = @as(u16, @intCast(screen_x)) +% @as(u16, self.scx);
-            const tile_col = (x >> 3) & 0x1F;
-            const tile_row = (y >> 3) & 0x1F;
-            const map_addr = tile_map_base + @as(u16, tile_row) * 32 + tile_col;
-
-            // Tile ID always from VRAM bank 0
-            const tile_id = vram_read(bus, map_addr);
-
-            // CGB tile attributes from VRAM bank 1
-            var bg_palette: u3 = 0;
-            var tile_vram_bank: u1 = 0;
-            var x_flip = false;
-            var y_flip = false;
-            var bg_prio = false;
-            if (cgb) {
-                const attrs = vram_bank_read(bus, 1, map_addr);
-                bg_palette = @truncate(attrs & 0x07);
-                tile_vram_bank = @truncate((attrs >> 3) & 0x01);
-                x_flip = (attrs & 0x20) != 0;
-                y_flip = (attrs & 0x40) != 0;
-                bg_prio = (attrs & 0x80) != 0;
-            }
-
-            // Tile data address
-            const tile_addr: u16 = if (tile_data_unsigned)
-                0x8000 + @as(u16, tile_id) * 16
-            else blk: {
-                const signed_id: i8 = @bitCast(tile_id);
-                const base: i32 = 0x9000;
-                break :blk @intCast(@as(u32, @bitCast(base + @as(i32, signed_id) * 16)));
-            };
-
-            var tile_y: u16 = y & 0x07;
-            if (y_flip) tile_y = 7 - tile_y;
-            const data_addr = tile_addr + tile_y * 2;
-
-            const lo = vram_bank_read(bus, tile_vram_bank, data_addr);
-            const hi = vram_bank_read(bus, tile_vram_bank, data_addr + 1);
-
-            var bit_x: u3 = @intCast(7 - (x & 0x07));
-            if (x_flip) bit_x = @intCast(x & 0x07);
-
-            const color_id: u2 = @truncate(
-                ((@as(u8, hi) >> bit_x) & 1) << 1 | ((@as(u8, lo) >> bit_x) & 1),
-            );
-
-            self.bg_color_indices[screen_x] = color_id;
-            self.bg_priority_flags[screen_x] = bg_prio;
-
-            if (cgb) {
-                display.set_pixel(@intCast(screen_x), self.ly, cgb_palette_color(&bus.bg_cram, bg_palette, color_id));
-            } else {
-                display.set_pixel(@intCast(screen_x), self.ly, palette_color(self.bgp, color_id));
+    fn oam_scan(self: *Ppu, bus: *Bus) void {
+        self.sprite_count = 0;
+        const tall = (self.lcdc & 0x04) != 0;
+        const h: i16 = if (tall) 16 else 8;
+        const ly_i: i16 = @intCast(self.ly);
+        for (0..40) |i| {
+            const base: u16 = @intCast(i * 4);
+            const sy = @as(i16, bus.oam[base]) - 16;
+            if (ly_i >= sy and ly_i < sy + h) {
+                self.scanline_sprites[self.sprite_count] = .{
+                    .y = sy,
+                    .x = @as(i16, bus.oam[base + 1]) - 8,
+                    .tile = bus.oam[base + 2],
+                    .attrs = bus.oam[base + 3],
+                    .oam_index = @intCast(i),
+                };
+                self.sprite_count += 1;
+                if (self.sprite_count >= 10) break;
             }
         }
     }
-
-    /// Render one scanline of the window layer
-    fn render_window_scanline(self: *Ppu, bus: *Bus) void {
-        const display = self.display orelse return;
+    fn start_drawing(self: *Ppu) void {
+        self.bg_fifo.clear();
+        self.pixels_pushed = 0;
+        self.fetcher_x = 0;
+        self.fetcher_state = .read_tile_id;
+        self.fetcher_ticks = 0;
+        self.scx_discard = self.scx & 0x07;
+        self.in_window = false;
+        self.window_triggered = false;
+        self.sprite_fetch_active = false;
+        self.initial_fetch_done = false;
+    }
+    fn check_sprite_at(self: *Ppu, screen_x: u8) ?u8 {
+        if (self.lcdc & 0x02 == 0) return null;
+        const sx: i16 = @intCast(screen_x);
+        for (0..self.sprite_count) |i| {
+            const sprite_x = self.scanline_sprites[i].x;
+            if (sprite_x == sx) return @intCast(i);
+            if (sx == 0 and sprite_x < 0 and sprite_x > -8) return @intCast(i);
+        }
+        return null;
+    }
+    fn fetch_sprite(self: *Ppu, bus: *Bus, sprite_idx: u8) void {
+        const sprite = self.scanline_sprites[sprite_idx];
+        const tall = (self.lcdc & 0x04) != 0;
+        const y_flip = (sprite.attrs & 0x40) != 0;
+        const x_flip = (sprite.attrs & 0x20) != 0;
         const cgb = bus.cgb_mode;
-        if (self.lcdc & 0x20 == 0) return;
-        if (!cgb and self.lcdc & 0x01 == 0) return;
-        if (self.ly < self.wy or self.wx > 166) return;
-
-        const tile_map_base: u16 = if (self.lcdc & 0x40 != 0) 0x9C00 else 0x9800;
-        const tile_data_unsigned = (self.lcdc & 0x10) != 0;
-        const win_y: u16 = self.window_line_counter;
-        var drew_pixel = false;
-
-        for (0..160) |screen_x| {
-            const wx_offset: i16 = @as(i16, @intCast(screen_x)) - (@as(i16, self.wx) - 7);
-            if (wx_offset < 0) continue;
-            const win_x: u16 = @intCast(wx_offset);
-
-            const tile_col = (win_x >> 3) & 0x1F;
-            const tile_row = (win_y >> 3) & 0x1F;
-            const map_addr = tile_map_base + @as(u16, tile_row) * 32 + tile_col;
-            const tile_id = vram_read(bus, map_addr);
-
-            var bg_palette: u3 = 0;
-            var tile_vram_bank: u1 = 0;
-            var x_flip = false;
-            var y_flip = false;
-            var bg_prio = false;
-            if (cgb) {
-                const attrs = vram_bank_read(bus, 1, map_addr);
-                bg_palette = @truncate(attrs & 0x07);
-                tile_vram_bank = @truncate((attrs >> 3) & 0x01);
-                x_flip = (attrs & 0x20) != 0;
-                y_flip = (attrs & 0x40) != 0;
-                bg_prio = (attrs & 0x80) != 0;
-            }
-
-            const tile_addr: u16 = if (tile_data_unsigned)
-                0x8000 + @as(u16, tile_id) * 16
-            else blk: {
-                const signed_id: i8 = @bitCast(tile_id);
-                const base: i32 = 0x9000;
-                break :blk @intCast(@as(u32, @bitCast(base + @as(i32, signed_id) * 16)));
-            };
-
-            var tile_y: u16 = win_y & 0x07;
-            if (y_flip) tile_y = 7 - tile_y;
-            const data_addr = tile_addr + tile_y * 2;
-            const lo = vram_bank_read(bus, tile_vram_bank, data_addr);
-            const hi = vram_bank_read(bus, tile_vram_bank, data_addr + 1);
-
-            var bit: u3 = @intCast(7 - (win_x & 0x07));
-            if (x_flip) bit = @intCast(win_x & 0x07);
-
+        var tile_id = sprite.tile;
+        if (tall) tile_id &= 0xFE;
+        var line: i16 = @as(i16, self.ly) - sprite.y;
+        const sprite_h: i16 = if (tall) 16 else 8;
+        if (y_flip) line = sprite_h - 1 - line;
+        const line_u16: u16 = @intCast(line);
+        const tile_addr: u16 = 0x8000 + @as(u16, tile_id) * 16 + line_u16 * 2;
+        var vbank: u1 = 0;
+        if (cgb) vbank = @truncate((sprite.attrs >> 3) & 0x01);
+        const lo = bus.vram[vbank][tile_addr - 0x8000];
+        const hi = bus.vram[vbank][tile_addr + 1 - 0x8000];
+        const screen_x: i16 = @intCast(self.pixels_pushed);
+        const fifo_len = self.bg_fifo.len();
+        for (0..8) |px| {
+            const px_screen = sprite.x + @as(i16, @intCast(px));
+            if (px_screen < 0 or px_screen >= 160) continue;
+            const fifo_pos_i = px_screen - screen_x;
+            if (fifo_pos_i < 0 or fifo_pos_i >= fifo_len) continue;
+            const fifo_pos: u4 = @intCast(fifo_pos_i);
+            const bit: u3 = if (x_flip) @intCast(px) else @intCast(7 - px);
             const color_id: u2 = @truncate(
                 ((@as(u8, hi) >> bit) & 1) << 1 | ((@as(u8, lo) >> bit) & 1),
             );
-
-            self.bg_color_indices[screen_x] = color_id;
-            self.bg_priority_flags[screen_x] = bg_prio;
-
+            if (color_id == 0) continue;
+            var sp_pixel = FifoPixel{
+                .color = color_id,
+                .is_sprite = true,
+                .bg_priority = (sprite.attrs & 0x80) != 0,
+            };
             if (cgb) {
-                display.set_pixel(@intCast(screen_x), self.ly, cgb_palette_color(&bus.bg_cram, bg_palette, color_id));
+                sp_pixel.palette = @truncate(sprite.attrs & 0x07);
             } else {
-                display.set_pixel(@intCast(screen_x), self.ly, palette_color(self.bgp, color_id));
+                sp_pixel.sprite_dmg_palette = if (sprite.attrs & 0x10 != 0) self.obp1 else self.obp0;
             }
-            drew_pixel = true;
-        }
-
-        if (drew_pixel) {
-            self.window_line_counter += 1;
-            self.window_was_active = true;
+            self.bg_fifo.overlay_at(fifo_pos, sp_pixel);
         }
     }
-
-    /// Render sprites (OBJ) for the current scanline
-    fn render_sprite_scanline(self: *Ppu, bus: *Bus) void {
-        const display = self.display orelse return;
-        const cgb = bus.cgb_mode;
-        if (self.lcdc & 0x02 == 0) return;
-
-        const tall_sprites = (self.lcdc & 0x04) != 0;
-        const sprite_height: i16 = if (tall_sprites) 16 else 8;
-
-        // Collect sprites on this scanline (max 10)
-        var sprite_indices: [10]u8 = undefined;
-        var sprite_count: u8 = 0;
-
-        for (0..40) |i| {
-            const oam_offset: u16 = @intCast(i * 4);
-            const sprite_y = @as(i16, bus.oam[oam_offset]) - 16;
-            const ly_i16: i16 = @intCast(self.ly);
-            if (ly_i16 >= sprite_y and ly_i16 < sprite_y + sprite_height) {
-                sprite_indices[sprite_count] = @intCast(i);
-                sprite_count += 1;
-                if (sprite_count >= 10) break;
+    fn bg_fetch_tick(self: *Ppu, bus: *Bus) void {
+        self.fetcher_ticks += 1;
+        if (self.fetcher_ticks < 2) return;
+        self.fetcher_ticks = 0;
+        switch (self.fetcher_state) {
+            .read_tile_id => {
+                var tile_map_base: u16 = undefined;
+                var tile_x: u8 = undefined;
+                var tile_y: u8 = undefined;
+                if (self.in_window) {
+                    tile_map_base = if (self.lcdc & 0x40 != 0) @as(u16, 0x9C00) else @as(u16, 0x9800);
+                    tile_x = self.fetcher_x;
+                    tile_y = self.window_line_counter / 8;
+                } else {
+                    tile_map_base = if (self.lcdc & 0x08 != 0) @as(u16, 0x9C00) else @as(u16, 0x9800);
+                    tile_x = ((self.scx / 8) +% self.fetcher_x) & 0x1F;
+                    tile_y = @truncate((@as(u16, self.ly) +% @as(u16, self.scy)) / 8 & 0x1F);
+                }
+                const map_addr = tile_map_base + @as(u16, tile_y) * 32 + @as(u16, tile_x);
+                self.fetch_tile_id = bus.vram[0][map_addr - 0x8000];
+                if (bus.cgb_mode) {
+                    self.fetch_tile_attrs = bus.vram[1][map_addr - 0x8000];
+                } else {
+                    self.fetch_tile_attrs = 0;
+                }
+                self.fetcher_state = .read_tile_data_lo;
+            },
+            .read_tile_data_lo => {
+                const addr = self.tile_data_address(bus);
+                const vbank: u1 = if (bus.cgb_mode) @truncate((self.fetch_tile_attrs >> 3) & 1) else 0;
+                self.fetch_tile_lo = bus.vram[vbank][addr - 0x8000];
+                self.fetcher_state = .read_tile_data_hi;
+            },
+            .read_tile_data_hi => {
+                const addr = self.tile_data_address(bus) + 1;
+                const vbank: u1 = if (bus.cgb_mode) @truncate((self.fetch_tile_attrs >> 3) & 1) else 0;
+                self.fetch_tile_hi = bus.vram[vbank][addr - 0x8000];
+                self.fetcher_state = .push;
+            },
+            .push => {
+                if (self.bg_fifo.len() <= 8) {
+                    self.push_bg_row(bus);
+                    self.fetcher_x +%= 1;
+                    self.fetcher_state = .read_tile_id;
+                    if (!self.initial_fetch_done) {
+                        self.initial_fetch_done = true;
+                    }
+                }
+            },
+        }
+    }
+    fn tile_data_address(self: *Ppu, bus: *Bus) u16 {
+        _ = bus;
+        const y_flip = (self.fetch_tile_attrs & 0x40) != 0;
+        var fine_y: u8 = undefined;
+        if (self.in_window) {
+            fine_y = self.window_line_counter & 0x07;
+        } else {
+            fine_y = @truncate((@as(u16, self.ly) +% @as(u16, self.scy)) & 0x07);
+        }
+        if (y_flip) fine_y = 7 - fine_y;
+        if (self.lcdc & 0x10 != 0) {
+            return 0x8000 + @as(u16, self.fetch_tile_id) * 16 + @as(u16, fine_y) * 2;
+        } else {
+            const signed_id: i32 = @as(i32, @as(i8, @bitCast(self.fetch_tile_id)));
+            const base: i32 = 0x9000 + signed_id * 16 + @as(i32, fine_y) * 2;
+            return @intCast(base);
+        }
+    }
+    fn push_bg_row(self: *Ppu, bus: *Bus) void {
+        const x_flip = (self.fetch_tile_attrs & 0x20) != 0;
+        const bg_prio = (self.fetch_tile_attrs & 0x80) != 0;
+        const cgb_palette: u3 = @truncate(self.fetch_tile_attrs & 0x07);
+        for (0..8) |px| {
+            const bit: u3 = if (x_flip) @intCast(px) else @intCast(7 - px);
+            const color_id: u2 = @truncate(
+                ((@as(u8, self.fetch_tile_hi) >> bit) & 1) << 1 |
+                    ((@as(u8, self.fetch_tile_lo) >> bit) & 1),
+            );
+            var pixel = FifoPixel{
+                .color = color_id,
+                .bg_priority = bg_prio,
+                .is_sprite = false,
+            };
+            if (bus.cgb_mode) {
+                pixel.palette = cgb_palette;
+            }
+            self.bg_fifo.push(pixel);
+        }
+    }
+    fn drawing_tick(self: *Ppu, bus: *Bus) void {
+        // Sprite fetch pauses BG fetcher and pixel output
+        if (self.sprite_fetch_active) {
+            self.sprite_fetch_ticks += 1;
+            if (self.sprite_fetch_ticks >= 6) {
+                self.fetch_sprite(bus, self.sprite_fetch_idx);
+                self.scanline_sprites[self.sprite_fetch_idx].x = -128;
+                self.sprite_fetch_active = false;
+                // After sprite fetch, restart BG fetcher from read_tile_id
+                // This matches hardware behavior where sprite fetch resets the fetcher
+                self.fetcher_state = .read_tile_id;
+                self.fetcher_ticks = 0;
+                if (self.check_sprite_at(self.pixels_pushed)) |idx| {
+                    self.sprite_fetch_active = true;
+                    self.sprite_fetch_idx = idx;
+                    self.sprite_fetch_ticks = 0;
+                }
+            }
+            return;
+        }
+        self.bg_fetch_tick(bus);
+        if (!self.initial_fetch_done) return;
+        if (self.bg_fifo.len() > 0) {
+            self.try_pop_pixel(bus);
+        }
+    }
+    fn try_pop_pixel(self: *Ppu, bus: *Bus) void {
+        if (self.bg_fifo.len() == 0) return;
+        // Discard SCX fine scroll pixels first
+        if (self.scx_discard > 0) {
+            _ = self.bg_fifo.pop();
+            self.scx_discard -= 1;
+            return;
+        }
+        // Window trigger: WY latched per-frame, WX checked per-pixel
+        if (!self.in_window and !self.window_triggered) {
+            if ((self.lcdc & 0x20 != 0) and self.wy_latch) {
+                const wx_i: i16 = @as(i16, self.wx) - 7;
+                const pp_i: i16 = @intCast(self.pixels_pushed);
+                if (pp_i >= wx_i) {
+                    self.in_window = true;
+                    self.window_triggered = true;
+                    self.bg_fifo.clear();
+                    self.fetcher_x = 0;
+                    self.fetcher_state = .read_tile_id;
+                    self.fetcher_ticks = 0;
+                    self.initial_fetch_done = false;
+                    return;
+                }
             }
         }
-
-        // Render in reverse order (lower OAM index = higher priority)
-        var idx: u8 = sprite_count;
-        while (idx > 0) {
-            idx -= 1;
-            const i = sprite_indices[idx];
-            const oam_base: u16 = @as(u16, i) * 4;
-            const sprite_y = @as(i16, bus.oam[oam_base]) - 16;
-            const sprite_x = @as(i16, bus.oam[oam_base + 1]) - 8;
-            var tile_id = bus.oam[oam_base + 2];
-            const attrs = bus.oam[oam_base + 3];
-
-            const obj_bg_priority = (attrs & 0x80) != 0;
-            const y_flip = (attrs & 0x40) != 0;
-            const x_flip = (attrs & 0x20) != 0;
-
-            // CGB: palette from attr bits 0-2, VRAM bank from bit 3
-            var obj_palette_num: u3 = 0;
-            var obj_vram_bank: u1 = 0;
-            if (cgb) {
-                obj_palette_num = @truncate(attrs & 0x07);
-                obj_vram_bank = @truncate((attrs >> 3) & 0x01);
+        // Sprite check — need FIFO >= 8 for correct overlay
+        if (self.check_sprite_at(self.pixels_pushed)) |idx| {
+            if (self.bg_fifo.len() >= 8) {
+                self.sprite_fetch_active = true;
+                self.sprite_fetch_idx = idx;
+                self.sprite_fetch_ticks = 0;
+                return;
             }
-            const dmg_palette = if (attrs & 0x10 != 0) self.obp1 else self.obp0;
-
-            if (tall_sprites) tile_id &= 0xFE;
-
-            var line: i16 = @as(i16, self.ly) - sprite_y;
-            if (line < 0 or line >= sprite_height) continue;
-            if (y_flip) line = sprite_height - 1 - line;
-
-            const line_u16: u16 = @intCast(line);
-            const tile_addr: u16 = 0x8000 + @as(u16, tile_id) * 16 + line_u16 * 2;
-            const lo = vram_bank_read(bus, if (cgb) obj_vram_bank else 0, tile_addr);
-            const hi = vram_bank_read(bus, if (cgb) obj_vram_bank else 0, tile_addr + 1);
-
-            for (0..8) |px| {
-                const screen_x = sprite_x + @as(i16, @intCast(px));
-                if (screen_x < 0 or screen_x >= 160) continue;
-                const sx: u32 = @intCast(screen_x);
-
-                const bit: u3 = if (x_flip)
-                    @intCast(px)
-                else
-                    @intCast(7 - px);
-
-                const color_id: u2 = @truncate(
-                    ((@as(u8, hi) >> bit) & 1) << 1 | ((@as(u8, lo) >> bit) & 1),
-                );
-
-                if (color_id == 0) continue; // transparent
-
-                // Priority logic
-                if (cgb) {
-                    // CGB priority: LCDC bit 0 acts as master priority
-                    // If LCDC.0 = 1: BG tile attr bit 7 or OAM attr bit 7 can hide sprite
-                    if (self.lcdc & 0x01 != 0) {
-                        // BG tile has priority flag set
-                        if (self.bg_priority_flags[sx] and self.bg_color_indices[sx] != 0) continue;
-                        // OAM priority flag set and BG is non-zero
-                        if (obj_bg_priority and self.bg_color_indices[sx] != 0) continue;
-                    }
-                    display.set_pixel(sx, self.ly, cgb_palette_color(&bus.obj_cram, obj_palette_num, color_id));
+            // FIFO too small for overlay — stall pop, let fetcher fill it
+            return;
+        }
+        const pixel = self.bg_fifo.pop();
+        self.render_pixel(bus, pixel);
+        self.pixels_pushed += 1;
+    }
+    fn render_pixel(self: *Ppu, bus: *Bus, pixel: FifoPixel) void {
+        const disp = self.display orelse return;
+        const x: u32 = @intCast(self.pixels_pushed);
+        const y: u32 = @intCast(self.ly);
+        if (bus.cgb_mode) {
+            const bg_enabled = (self.lcdc & 0x01) != 0;
+            if (pixel.is_sprite) {
+                const color = cgb_palette_color(&bus.obj_cram, pixel.palette, pixel.color);
+                disp.set_pixel(x, y, color);
+            } else {
+                if (!bg_enabled) {
+                    disp.set_pixel(x, y, cgb_palette_color(&bus.bg_cram, 0, 0));
                 } else {
-                    // DMG priority
-                    if (obj_bg_priority) {
-                        if (self.bg_color_indices[sx] != 0) continue;
-                    }
-                    display.set_pixel(sx, self.ly, palette_color(dmg_palette, color_id));
+                    const color = cgb_palette_color(&bus.bg_cram, pixel.palette, pixel.color);
+                    disp.set_pixel(x, y, color);
+                }
+            }
+        } else {
+            if (pixel.is_sprite) {
+                const color = palette_color(pixel.sprite_dmg_palette, pixel.color);
+                disp.set_pixel(x, y, color);
+            } else {
+                if (self.lcdc & 0x01 == 0) {
+                    disp.set_pixel(x, y, DMG_COLORS[0]);
+                } else {
+                    const color = palette_color(self.bgp, pixel.color);
+                    disp.set_pixel(x, y, color);
                 }
             }
         }
     }
-
-    /// Render a complete scanline (BG + Window + Sprites)
-    fn render_scanline(self: *Ppu, bus: *Bus) void {
-        self.render_bg_scanline(bus);
-        self.render_window_scanline(bus);
-        self.render_sprite_scanline(bus);
-    }
-
     pub fn step(self: *Ppu, bus: *Bus, cycles: u16) void {
         if (!self.enabled) return;
-
-        self.cycle_counter += cycles;
-
+        var remaining = cycles;
+        while (remaining > 0) : (remaining -= 1) {
+            self.dot(bus);
+        }
+    }
+    fn dot(self: *Ppu, bus: *Bus) void {
+        self.cycle_counter += 1;
         switch (self.mode) {
             .OAMScan => {
+                if (self.cycle_counter == 1) {
+                    self.check_lyc(bus);
+                    if (self.ly == self.wy) {
+                        self.wy_latch = true;
+                    }
+                }
+                if (self.cycle_counter == 4) {
+                    self.oam_scan(bus);
+                }
                 if (self.cycle_counter >= 80) {
-                    self.cycle_counter -= 80;
                     self.mode = .Drawing;
                     self.set_mode(bus);
+                    self.start_drawing();
                 }
             },
             .Drawing => {
-                if (self.cycle_counter >= 172) {
-                    self.cycle_counter -= 172;
-                    self.render_scanline(bus);
+                self.drawing_tick(bus);
+                if (self.pixels_pushed >= 160) {
                     self.mode = .HBlank;
                     self.set_mode(bus);
-                    // CGB HBlank DMA
-                    if (bus.cgb_mode) {
-                        bus.do_hblank_hdma();
+                    bus.do_hblank_hdma();
+                    if (self.window_triggered) {
+                        self.window_line_counter += 1;
+                        self.window_was_active = true;
                     }
+                }
+                if (self.cycle_counter >= 456 and self.pixels_pushed < 160) {
+                    self.pixels_pushed = 160;
+                    self.mode = .HBlank;
+                    self.set_mode(bus);
+                    bus.do_hblank_hdma();
                 }
             },
             .HBlank => {
-                if (self.cycle_counter >= 204) {
-                    self.cycle_counter -= 204;
+                if (self.cycle_counter >= 456) {
+                    self.cycle_counter = 0;
                     self.ly += 1;
-
-                    if (self.ly == 144) {
+                    if (self.ly >= 144) {
                         self.mode = .VBlank;
-                        bus.request_interrupt(.VBlank);
                         self.set_mode(bus);
-                        self.check_lyc(bus);
-                        if (self.display) |d| d.update();
+                        bus.request_interrupt(.VBlank);
+                        if (self.display) |disp| {
+                            disp.update();
+                        }
                     } else {
                         self.mode = .OAMScan;
-                        self.check_lyc(bus);
                         self.set_mode(bus);
                     }
                 }
             },
             .VBlank => {
+                if (self.cycle_counter == 1) {
+                    self.check_lyc(bus);
+                }
                 if (self.cycle_counter >= 456) {
-                    self.cycle_counter -= 456;
+                    self.cycle_counter = 0;
                     self.ly += 1;
                     if (self.ly > 153) {
                         self.ly = 0;
                         self.window_line_counter = 0;
                         self.window_was_active = false;
+                        self.wy_latch = false;
                         self.mode = .OAMScan;
-                        self.check_lyc(bus);
                         self.set_mode(bus);
-                    } else {
-                        self.check_lyc(bus);
                     }
                 }
             },

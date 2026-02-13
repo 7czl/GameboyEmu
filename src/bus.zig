@@ -255,6 +255,7 @@ pub const Bus = struct {
             },
             0xFF41 => {
                 self.ppu.stat = (value & 0xF8) | (self.ppu.stat & 0x07);
+                self.ppu.update_stat_irq(self);
             },
             0xFF42 => {
                 self.ppu.scy = value;
