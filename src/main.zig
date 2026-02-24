@@ -27,6 +27,7 @@ pub fn main() !void {
     var boot_rom_path: []const u8 = "dmg_boot.bin";
     var headless = false;
     var max_cycles: u64 = 0; // 0 = unlimited
+    var force_dmg = false;
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -40,6 +41,8 @@ pub fn main() !void {
         } else if (std.mem.eql(u8, args[i], "--boot-rom")) {
             i += 1;
             if (i < args.len) boot_rom_path = args[i];
+        } else if (std.mem.eql(u8, args[i], "--dmg")) {
+            force_dmg = true;
         } else {
             rom_path = args[i];
         }
@@ -82,7 +85,7 @@ pub fn main() !void {
     var timer = Timer.init();
     var joypad = Joypad.init();
     var apu = Apu.init();
-    var bus = Bus.init(rom_bytes, boot_rom_bytes, &timer, &ppu, &joypad, &apu);
+    var bus = Bus.init(rom_bytes, boot_rom_bytes, &timer, &ppu, &joypad, &apu, force_dmg);
     var cpu = Cpu.init();
 
     // Determine save file path and load if battery-backed
