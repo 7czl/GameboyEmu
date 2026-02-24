@@ -21,6 +21,7 @@ const FifoPixel = struct {
     bg_priority: bool = false,
     is_sprite: bool = false,
     sprite_dmg_palette: u8 = 0,
+    oam_index: u8 = 0,
 };
 const PixelFifo = struct {
     pixels: [16]FifoPixel = @splat(FifoPixel{}),
@@ -45,12 +46,30 @@ const PixelFifo = struct {
     fn len(self: *const PixelFifo) u4 {
         return self.count;
     }
-    fn overlay_at(self: *PixelFifo, pos: u4, sp: FifoPixel) void {
+    fn overlay_at(self: *PixelFifo, pos: u4, sp: FifoPixel, cgb_mode: bool, master_priority: bool, oam_priority: bool) void {
         const idx = (self.head +% pos) & 0xF;
         const existing = self.pixels[idx];
-        if (existing.is_sprite) return;
+        if (existing.is_sprite) {
+            // In CGB OAM priority mode, lower OAM index wins over higher
+            if (cgb_mode and oam_priority and sp.oam_index < existing.oam_index) {
+                // New sprite has lower OAM index — it wins
+                self.pixels[idx] = sp;
+            }
+            return;
+        }
         if (sp.color == 0) return;
-        if (sp.bg_priority and existing.color != 0) return;
+        if (cgb_mode) {
+            // CGB priority: LCDC bit 0 is "master priority"
+            if (master_priority) {
+                // Master priority enabled: check BG map attr bit 7 and OAM attr bit 7
+                if (existing.bg_priority and existing.color != 0) return; // BG map attr bit 7 set
+                if (sp.bg_priority and existing.color != 0) return; // OAM attr bit 7 set
+            }
+            // Master priority disabled (LCDC bit 0 = 0): sprites always on top
+        } else {
+            // DMG: OAM attr bit 7 only
+            if (sp.bg_priority and existing.color != 0) return;
+        }
         self.pixels[idx] = sp;
     }
 };
@@ -236,13 +255,15 @@ pub const Ppu = struct {
                 .color = color_id,
                 .is_sprite = true,
                 .bg_priority = (sprite.attrs & 0x80) != 0,
+                .oam_index = sprite.oam_index,
             };
             if (cgb) {
                 sp_pixel.palette = @truncate(sprite.attrs & 0x07);
             } else {
                 sp_pixel.sprite_dmg_palette = if (sprite.attrs & 0x10 != 0) self.obp1 else self.obp0;
             }
-            self.bg_fifo.overlay_at(fifo_pos, sp_pixel);
+            const master_priority = (self.lcdc & 0x01) != 0;
+            self.bg_fifo.overlay_at(fifo_pos, sp_pixel, cgb, master_priority, bus.obj_priority_by_oam);
         }
     }
     fn bg_fetch_tick(self: *Ppu, bus: *Bus) void {
@@ -406,17 +427,12 @@ pub const Ppu = struct {
         const x: u32 = @intCast(self.pixels_pushed);
         const y: u32 = @intCast(self.ly);
         if (bus.cgb_mode) {
-            const bg_enabled = (self.lcdc & 0x01) != 0;
             if (pixel.is_sprite) {
                 const color = cgb_palette_color(&bus.obj_cram, pixel.palette, pixel.color);
                 disp.set_pixel(x, y, color);
             } else {
-                if (!bg_enabled) {
-                    disp.set_pixel(x, y, cgb_palette_color(&bus.bg_cram, 0, 0));
-                } else {
-                    const color = cgb_palette_color(&bus.bg_cram, pixel.palette, pixel.color);
-                    disp.set_pixel(x, y, color);
-                }
+                const color = cgb_palette_color(&bus.bg_cram, pixel.palette, pixel.color);
+                disp.set_pixel(x, y, color);
             }
         } else {
             if (pixel.is_sprite) {

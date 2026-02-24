@@ -32,6 +32,8 @@ pub const Bus = struct {
     obj_cram: [64]u8,
     bg_cram_index: u8 = 0, // BCPS ($FF68) — bit 0-5: index, bit 7: auto-increment
     obj_cram_index: u8 = 0, // OCPS ($FF6A)
+    // CGB object priority mode: true = by OAM position (CGB default), false = by X coordinate (DMG compat)
+    obj_priority_by_oam: bool = true,
     // CGB double speed
     double_speed: bool = false,
     speed_switch_armed: bool = false, // KEY1 bit 0
@@ -49,7 +51,7 @@ pub const Bus = struct {
         Joypad = 1 << 4,
     };
 
-    pub fn init(rom: []const u8, boot_rom: []const u8, timer_ptr: *Timer, ppu_ptr: *Ppu, joypad_ptr: *Joypad, apu_ptr: *Apu) Bus {
+    pub fn init(rom: []const u8, boot_rom: []const u8, timer_ptr: *Timer, ppu_ptr: *Ppu, joypad_ptr: *Joypad, apu_ptr: *Apu, force_dmg: bool) Bus {
         const cart_type = if (rom.len > 0x147) rom[0x147] else 0;
         const mbc = Mbc.from_cartridge_type(cart_type, rom.len);
         std.log.info("MBC: cartridge type=0x{X:0>2}, using {s}", .{
@@ -64,8 +66,10 @@ pub const Bus = struct {
         });
         // Detect CGB mode from ROM header byte 0x143
         const cgb_flag = if (rom.len > 0x143) rom[0x143] else 0;
-        const cgb_mode = (cgb_flag == 0x80 or cgb_flag == 0xC0);
-        if (cgb_mode) {
+        const cgb_mode = if (force_dmg) false else (cgb_flag == 0x80 or cgb_flag == 0xC0);
+        if (force_dmg) {
+            std.log.info("Forced DMG mode (--dmg)", .{});
+        } else if (cgb_mode) {
             std.log.info("CGB mode detected (flag=0x{X:0>2})", .{cgb_flag});
         }
         return Bus{
@@ -181,6 +185,10 @@ pub const Bus = struct {
             0xFF6B => { // OCPD — OBJ palette data
                 if (!self.cgb_mode) return 0xFF;
                 return self.obj_cram[self.obj_cram_index & 0x3F];
+            },
+            0xFF6C => { // OPRI — Object priority mode
+                if (!self.cgb_mode) return 0xFF;
+                return if (self.obj_priority_by_oam) @as(u8, 0xFE) else @as(u8, 0xFF);
             },
             0xFF70 => { // SVBK — WRAM bank
                 if (!self.cgb_mode) return 0xFF;
@@ -352,6 +360,11 @@ pub const Bus = struct {
                     }
                 }
             },
+            0xFF6C => { // OPRI — Object priority mode
+                if (self.cgb_mode) {
+                    self.obj_priority_by_oam = (value & 0x01) == 0;
+                }
+            },
             0xFF70 => { // SVBK — WRAM bank select
                 if (self.cgb_mode) {
                     const bank = value & 0x07;
@@ -446,5 +459,143 @@ pub const Bus = struct {
     /// Read VRAM with explicit bank selection (used by PPU for CGB tile attributes)
     pub fn vram_bank_read(self: *Bus, bank: u1, address: u16) u8 {
         return self.vram[bank][address - 0x8000];
+    }
+
+    // --- DMG OAM Corruption Bug ---
+    // On DMG hardware, certain 16-bit register operations touching the OAM
+    // range ($FE00-$FEFF) during PPU mode 2 (OAM scan) corrupt OAM data.
+    // CGB/AGB hardware is not affected.
+
+    /// Read a 16-bit word from OAM at the given byte offset.
+    fn oam_read_word(self: *Bus, offset: usize) u16 {
+        return @as(u16, self.oam[offset + 1]) << 8 | self.oam[offset];
+    }
+
+    /// Write a 16-bit word to OAM at the given byte offset.
+    fn oam_write_word(self: *Bus, offset: usize, val: u16) void {
+        self.oam[offset] = @truncate(val);
+        self.oam[offset + 1] = @truncate(val >> 8);
+    }
+
+    /// Returns the OAM row (0-19) currently being accessed by the PPU,
+    /// or null if the PPU is not in OAM scan mode.
+    fn oam_scan_row(self: *Bus) ?usize {
+        if (!self.ppu.enabled) return null;
+        if (self.ppu.mode != .OAMScan) return null;
+        if (self.ppu.cycle_counter > 79) return null;
+        // PPU reads one OAM row per M-cycle (4 T-cycles).
+        // cycle_counter 0-3 = row 0, 4-7 = row 1, etc.
+        return @as(usize, @intCast(self.ppu.cycle_counter)) / 4;
+    }
+
+    /// Apply write corruption to the given OAM row.
+    /// row[0] = ((a ^ c) & (b ^ c)) ^ c; row[1..3] copied from preceding row.
+    fn oam_write_corruption(self: *Bus, row: usize) void {
+        if (row == 0) return; // first row (sprites 1&2) unaffected
+        const cur = row * 8;
+        const prev = (row - 1) * 8;
+        const a = self.oam_read_word(cur);
+        const b = self.oam_read_word(prev);
+        const c = self.oam_read_word(prev + 4);
+        self.oam_write_word(cur, ((a ^ c) & (b ^ c)) ^ c);
+        // Copy last 3 words from preceding row
+        self.oam_write_word(cur + 2, self.oam_read_word(prev + 2));
+        self.oam_write_word(cur + 4, self.oam_read_word(prev + 4));
+        self.oam_write_word(cur + 6, self.oam_read_word(prev + 6));
+    }
+
+    /// Apply read corruption to the given OAM row.
+    /// row[0] = b | (a & c); row[1..3] copied from preceding row.
+    fn oam_read_corruption(self: *Bus, row: usize) void {
+        if (row == 0) return;
+        const cur = row * 8;
+        const prev = (row - 1) * 8;
+        const a = self.oam_read_word(cur);
+        const b = self.oam_read_word(prev);
+        const c = self.oam_read_word(prev + 4);
+        self.oam_write_word(cur, b | (a & c));
+        self.oam_write_word(cur + 2, self.oam_read_word(prev + 2));
+        self.oam_write_word(cur + 4, self.oam_read_word(prev + 4));
+        self.oam_write_word(cur + 6, self.oam_read_word(prev + 6));
+    }
+
+    /// Apply the "read during increase/decrease" corruption pattern.
+    /// This is the complex pattern triggered by INC/DEC rr when rr is in OAM.
+    fn oam_inc_dec_corruption(self: *Bus, row: usize) void {
+        // Complex corruption only for rows 4-18 (not first four, not last)
+        if (row >= 4 and row < 19) {
+            const cur = row * 8;
+            const prev = (row - 1) * 8;
+            const prev2 = (row - 2) * 8;
+            const a = self.oam_read_word(prev2); // two rows before
+            const b = self.oam_read_word(prev); // preceding row (being corrupted)
+            const c = self.oam_read_word(cur); // current row
+            const d = self.oam_read_word(prev + 4); // third word of preceding row
+            self.oam_write_word(prev, (b & (a | c | d)) | (a & c & d));
+            // Copy preceding row (after corruption) to current row and two rows before
+            var i: usize = 0;
+            while (i < 8) : (i += 2) {
+                const val = self.oam_read_word(prev + i);
+                self.oam_write_word(cur + i, val);
+                self.oam_write_word(prev2 + i, val);
+            }
+        }
+        // Always apply normal read corruption (rows 1+)
+        self.oam_read_corruption(row);
+    }
+
+    /// Called by CPU for INC rr / DEC rr when rr is in OAM range.
+    /// "Write During Increase/Decrease" — behaves like a single write corruption.
+    pub fn oam_bug_inc_dec(self: *Bus, addr: u16) void {
+        if (self.cgb_mode) return;
+        if (addr < 0xFE00 or addr > 0xFEFF) return;
+        const row = self.oam_scan_row() orelse return;
+        self.oam_write_corruption(row);
+    }
+
+    /// Called by CPU for ld a,[hli] / ld a,[hld] when HL is in OAM range.
+    /// "Read During Increase/Decrease" — the read from OAM triggers read
+    /// corruption, and the HL increment/decrement triggers write corruption.
+    pub fn oam_bug_read_inc_dec(self: *Bus, addr: u16) void {
+        if (self.cgb_mode) return;
+        if (addr < 0xFE00 or addr > 0xFEFF) return;
+        const row = self.oam_scan_row() orelse return;
+        self.oam_write_corruption(row);
+        self.oam_read_corruption(row);
+    }
+
+    /// Called by CPU for POP rr: each byte read involves a read + SP increment
+    /// in the same M-cycle, similar to LDI/LDD. This triggers the complex
+    /// "read during increase" corruption pattern.
+    pub fn oam_bug_pop(self: *Bus, addr: u16) void {
+        if (self.cgb_mode) return;
+        if (addr < 0xFE00 or addr > 0xFEFF) return;
+        const row = self.oam_scan_row() orelse return;
+        self.oam_inc_dec_corruption(row);
+    }
+
+    /// Called by CPU for PUSH rr / CALL / RST when SP is in OAM range.
+    /// Triggers effectively 3 write corruptions (4 total but one overlaps).
+    pub fn oam_bug_push(self: *Bus, addr: u16) void {
+        if (self.cgb_mode) return;
+        if (addr < 0xFE00 or addr > 0xFEFF) return;
+        const row = self.oam_scan_row() orelse return;
+        self.oam_write_corruption(row);
+        self.oam_write_corruption(row);
+        self.oam_write_corruption(row);
+    }
+
+    /// Called by CPU when OAM is read during mode 2. DMG only.
+    pub fn oam_bug_read(self: *Bus) void {
+        if (self.cgb_mode) return;
+        const row = self.oam_scan_row() orelse return;
+        self.oam_read_corruption(row);
+    }
+
+    /// Called by CPU when OAM is written during mode 2. DMG only.
+    pub fn oam_bug_write(self: *Bus) void {
+        if (self.cgb_mode) return;
+        const row = self.oam_scan_row() orelse return;
+        self.oam_write_corruption(row);
     }
 };
