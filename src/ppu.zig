@@ -231,6 +231,8 @@ pub const Ppu = struct {
         if (tall) tile_id &= 0xFE;
         var line: i16 = @as(i16, self.ly) - sprite.y;
         const sprite_h: i16 = if (tall) 16 else 8;
+        // Guard against out-of-range line (can happen if OAM is modified between scan and draw)
+        if (line < 0 or line >= sprite_h) return;
         if (y_flip) line = sprite_h - 1 - line;
         const line_u16: u16 = @intCast(line);
         const tile_addr: u16 = 0x8000 + @as(u16, tile_id) * 16 + line_u16 * 2;
