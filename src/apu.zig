@@ -66,9 +66,13 @@ pub const Apu = struct {
         return Apu{};
     }
 
-    pub fn step(self: *Apu, t_cycles: u32, div_counter: u16) void {
+    pub fn step(self: *Apu, t_cycles: u32, div_counter: u16, double_speed: bool) void {
         // Frame sequencer: clocked by falling edge of DIV bit 4 (512 Hz)
-        const div_bit = (div_counter & 0x1000) != 0;
+        // In CGB double speed, DIV counter runs at 2x, so check bit 5 instead
+        const div_bit = if (double_speed)
+            (div_counter & 0x2000) != 0
+        else
+            (div_counter & 0x1000) != 0;
         if (self.prev_div_bit and !div_bit) {
             if (self.enabled) self.clock_frame_sequencer();
         }
