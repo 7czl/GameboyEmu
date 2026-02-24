@@ -122,7 +122,14 @@ pub const Bus = struct {
     fn read_io(self: *Bus, address: u16) u8 {
         switch (address) {
             0xFF00 => return self.joypad.read(self.joypad_select),
-            0xFF04 => return @truncate(self.timer.div_counter >> 8),
+            0xFF04 => {
+                // In CGB double speed, DIV counter runs at 2x CPU clock,
+                // so shift right by 9 instead of 8 to maintain same wall-clock rate
+                if (self.double_speed) {
+                    return @truncate(self.timer.div_counter >> 9);
+                }
+                return @truncate(self.timer.div_counter >> 8);
+            },
             0xFF05 => return self.timer.tima,
             0xFF06 => return self.timer.tma,
             0xFF07 => return self.timer.tac,
@@ -250,6 +257,10 @@ pub const Bus = struct {
                 const new_enabled = (value & 0x80) != 0;
                 if (!old_enabled and new_enabled) {
                     self.ppu.enabled = true;
+                    // LCD turn-on: first scanline is shorter than normal.
+                    // Hardware starts the PPU 4 T-cycles into the scanline,
+                    // so LY increments after 452 dots instead of 456.
+                    self.ppu.cycle_counter = 4;
                 } else if (old_enabled and !new_enabled) {
                     self.ppu.reset();
                 }
