@@ -8,3 +8,4 @@ giibiiadvance
 *.sh
 roms/
 gb-test-roms/
+.kiro/
