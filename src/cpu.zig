@@ -171,6 +171,7 @@ pub const CPU = struct {
             },
             0x03 => { // inc bc
                 var bc = self.get_bc();
+                bus.oam_bug_inc_dec(bc);
                 bc +%= 1;
                 self.set_bc(bc);
                 self.pc += 1;
@@ -247,6 +248,7 @@ pub const CPU = struct {
             },
             0x0B => { // DEC BC
                 var bc = self.get_bc();
+                bus.oam_bug_inc_dec(bc);
                 bc -%= 1;
                 self.set_bc(bc);
                 self.pc += 1;
@@ -325,6 +327,7 @@ pub const CPU = struct {
             },
             0x13 => { // INC DE
                 var de = self.get_de();
+                bus.oam_bug_inc_dec(de);
                 de +%= 1;
                 self.set_de(de);
                 self.pc += 1;
@@ -398,6 +401,7 @@ pub const CPU = struct {
             },
             0x1B => { // DEC DE
                 var de = self.get_de();
+                bus.oam_bug_inc_dec(de);
                 de -%= 1;
                 self.set_de(de);
                 self.pc += 1;
@@ -466,6 +470,7 @@ pub const CPU = struct {
             0x22 => { // LD (HL+), A
                 var hl = self.get_hl();
                 self.write_tick(bus, hl, self.a);
+                bus.oam_bug_inc_dec(hl);
                 hl +%= 1;
                 self.set_hl(hl);
                 self.pc += 1;
@@ -473,6 +478,7 @@ pub const CPU = struct {
             },
             0x23 => { // INC HL
                 var hl_val = self.get_hl();
+                bus.oam_bug_inc_dec(hl_val);
                 hl_val +%= 1;
                 self.set_hl(hl_val);
                 self.pc += 1;
@@ -572,6 +578,7 @@ pub const CPU = struct {
             0x2A => { // LD A, (HL+)
                 var hl = self.get_hl();
                 self.a = self.read_tick(bus, hl);
+                bus.oam_bug_read_inc_dec(hl);
                 hl +%= 1;
                 self.set_hl(hl);
                 self.pc += 1;
@@ -579,6 +586,7 @@ pub const CPU = struct {
             },
             0x2B => { // DEC HL
                 var hl = self.get_hl();
+                bus.oam_bug_inc_dec(hl);
                 hl -%= 1;
                 self.set_hl(hl);
                 self.pc += 1;
@@ -644,12 +652,14 @@ pub const CPU = struct {
             0x32 => { // LD (HL-), A
                 var hl = self.get_hl();
                 self.write_tick(bus, hl, self.a);
+                bus.oam_bug_inc_dec(hl);
                 hl -%= 1;
                 self.set_hl(hl);
                 self.pc += 1;
                 return 8;
             },
             0x33 => { // INC SP
+                bus.oam_bug_inc_dec(self.sp);
                 self.sp +%= 1;
                 self.pc += 1;
                 return 8;
@@ -729,12 +739,14 @@ pub const CPU = struct {
             0x3A => { //LD A, (HL-)
                 var hl = self.get_hl();
                 self.a = self.read_tick(bus, hl);
+                bus.oam_bug_read_inc_dec(hl);
                 hl -%= 1;
                 self.set_hl(hl);
                 self.pc += 1;
                 return 8;
             },
             0x3B => { // DEC SP
+                bus.oam_bug_inc_dec(self.sp);
                 self.sp -%= 1;
                 self.pc += 1;
                 return 8;
@@ -1891,8 +1903,10 @@ pub const CPU = struct {
                 }
             },
             0xC1 => { // POP BC
+                bus.oam_bug_pop(self.sp);
                 self.c = self.read_tick(bus, self.sp);
                 self.sp +%= 1;
+                bus.oam_bug_pop(self.sp);
                 self.b = self.read_tick(bus, self.sp);
                 self.sp +%= 1;
                 self.pc += 1;
@@ -1934,9 +1948,17 @@ pub const CPU = struct {
                 }
             },
             0xC5 => { // PUSH BC
+                // M2: internal tick — SP decrement triggers write corruption
+                bus.oam_bug_inc_dec(self.sp);
+                self.tick(bus, 4); // explicit internal M-cycle
                 self.sp -%= 1;
+                // M3: write high byte. If writing to OAM during mode 2,
+                // the write itself triggers additional write corruption.
+                bus.oam_bug_inc_dec(self.sp);
                 self.write_tick(bus, self.sp, self.b);
                 self.sp -%= 1;
+                // M4: write low byte
+                bus.oam_bug_inc_dec(self.sp);
                 self.write_tick(bus, self.sp, self.c);
                 self.pc += 1;
                 return 16;
@@ -3872,8 +3894,10 @@ pub const CPU = struct {
                 }
             },
             0xD1 => { // POP DE
+                bus.oam_bug_pop(self.sp);
                 const lo = self.read_tick(bus, self.sp);
                 self.sp +%= 1;
+                bus.oam_bug_pop(self.sp);
                 const hi = self.read_tick(bus, self.sp);
                 self.sp +%= 1;
                 self.e = lo;
@@ -3915,9 +3939,13 @@ pub const CPU = struct {
                 }
             },
             0xD5 => { // PUSH DE
+                bus.oam_bug_inc_dec(self.sp);
+                self.tick(bus, 4);
                 self.sp -%= 1;
+                bus.oam_bug_inc_dec(self.sp);
                 self.write_tick(bus, self.sp, self.d);
                 self.sp -%= 1;
+                bus.oam_bug_inc_dec(self.sp);
                 self.write_tick(bus, self.sp, self.e);
                 self.pc += 1;
                 return 16;
@@ -4029,8 +4057,10 @@ pub const CPU = struct {
                 return 12;
             },
             0xE1 => { // POP HL
+                bus.oam_bug_pop(self.sp);
                 self.l = self.read_tick(bus, self.sp);
                 self.sp +%= 1;
+                bus.oam_bug_pop(self.sp);
                 self.h = self.read_tick(bus, self.sp);
                 self.sp +%= 1;
                 self.pc += 1;
@@ -4044,9 +4074,13 @@ pub const CPU = struct {
             },
 
             0xE5 => { // PUSH HL
+                bus.oam_bug_inc_dec(self.sp);
+                self.tick(bus, 4);
                 self.sp -%= 1;
+                bus.oam_bug_inc_dec(self.sp);
                 self.write_tick(bus, self.sp, self.h);
                 self.sp -%= 1;
+                bus.oam_bug_inc_dec(self.sp);
                 self.write_tick(bus, self.sp, self.l);
                 self.pc += 1;
                 return 16;
@@ -4140,9 +4174,11 @@ pub const CPU = struct {
                 return 12;
             },
             0xF1 => { // POP AF
+                bus.oam_bug_pop(self.sp);
                 const val = self.read_tick(bus, self.sp);
                 self.f = val & 0xF0; // lower 4 bits of F are always 0
                 self.sp +%= 1;
+                bus.oam_bug_pop(self.sp);
                 self.a = self.read_tick(bus, self.sp);
                 self.sp +%= 1;
                 self.pc += 1;
@@ -4161,9 +4197,13 @@ pub const CPU = struct {
                 return 4;
             },
             0xF5 => { // PUSH AF
+                bus.oam_bug_inc_dec(self.sp);
+                self.tick(bus, 4);
                 self.sp -%= 1;
+                bus.oam_bug_inc_dec(self.sp);
                 self.write_tick(bus, self.sp, self.a);
                 self.sp -%= 1;
+                bus.oam_bug_inc_dec(self.sp);
                 self.write_tick(bus, self.sp, self.f);
                 self.pc += 1;
                 return 16;
