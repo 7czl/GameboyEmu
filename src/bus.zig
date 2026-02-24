@@ -57,6 +57,7 @@ pub const Bus = struct {
             switch (mbc) {
                 .none => "NoMbc",
                 .mbc1 => "MBC1",
+                .mbc2 => "MBC2",
                 .mbc3 => "MBC3",
                 .mbc5 => "MBC5",
             },
