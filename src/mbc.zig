@@ -1,11 +1,12 @@
 // MBC (Memory Bank Controller) implementations
-// Supports NoMbc, MBC1, MBC3, and MBC5
+// Supports NoMbc, MBC1, MBC2, MBC3, and MBC5
 
 const std = @import("std");
 
 pub const MbcType = enum {
     none,
     mbc1,
+    mbc2,
     mbc3,
     mbc5,
 };
@@ -13,6 +14,7 @@ pub const MbcType = enum {
 pub const Mbc = union(MbcType) {
     none: NoMbc,
     mbc1: Mbc1,
+    mbc2: Mbc2,
     mbc3: Mbc3,
     mbc5: Mbc5,
 
@@ -21,6 +23,7 @@ pub const Mbc = union(MbcType) {
         return switch (cart_type) {
             0x00, 0x08, 0x09 => .{ .none = NoMbc.init() },
             0x01, 0x02, 0x03 => .{ .mbc1 = Mbc1.init(rom_size) },
+            0x05, 0x06 => .{ .mbc2 = Mbc2.init(rom_size) },
             0x0F, 0x10, 0x11, 0x12, 0x13 => .{ .mbc3 = Mbc3.init(rom_size) },
             0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E => .{ .mbc5 = Mbc5.init(rom_size) },
             else => {
@@ -35,6 +38,7 @@ pub const Mbc = union(MbcType) {
         return switch (self.*) {
             .none => |*m| m.read_rom(rom, address),
             .mbc1 => |*m| m.read_rom(rom, address),
+            .mbc2 => |*m| m.read_rom(rom, address),
             .mbc3 => |*m| m.read_rom(rom, address),
             .mbc5 => |*m| m.read_rom(rom, address),
         };
@@ -45,6 +49,7 @@ pub const Mbc = union(MbcType) {
         return switch (self.*) {
             .none => 0xFF,
             .mbc1 => |*m| m.read_ram(address),
+            .mbc2 => |*m| m.read_ram(address),
             .mbc3 => |*m| m.read_ram(address),
             .mbc5 => |*m| m.read_ram(address),
         };
@@ -55,6 +60,7 @@ pub const Mbc = union(MbcType) {
         switch (self.*) {
             .none => {},
             .mbc1 => |*m| m.write_rom(address, value),
+            .mbc2 => |*m| m.write_rom(address, value),
             .mbc3 => |*m| m.write_rom(address, value),
             .mbc5 => |*m| m.write_rom(address, value),
         }
@@ -65,6 +71,7 @@ pub const Mbc = union(MbcType) {
         switch (self.*) {
             .none => {},
             .mbc1 => |*m| m.write_ram(address, value),
+            .mbc2 => |*m| m.write_ram(address, value),
             .mbc3 => |*m| m.write_ram(address, value),
             .mbc5 => |*m| m.write_ram(address, value),
         }
@@ -90,6 +97,7 @@ pub const Mbc = union(MbcType) {
         return switch (self.*) {
             .none => null,
             .mbc1 => |*m| &m.ram,
+            .mbc2 => |*m| &m.ram,
             .mbc3 => |*m| &m.ram,
             .mbc5 => |*m| &m.ram,
         };
@@ -100,6 +108,10 @@ pub const Mbc = union(MbcType) {
         switch (self.*) {
             .none => {},
             .mbc1 => |*m| {
+                const len = @min(data.len, m.ram.len);
+                @memcpy(m.ram[0..len], data[0..len]);
+            },
+            .mbc2 => |*m| {
                 const len = @min(data.len, m.ram.len);
                 @memcpy(m.ram[0..len], data[0..len]);
             },
@@ -206,6 +218,65 @@ const Mbc1 = struct {
         const bank: u16 = if (self.banking_mode == 1) self.ram_bank else 0;
         const offset = @as(u32, bank) * 0x2000 + (address - 0xA000);
         if (offset < self.ram.len) self.ram[offset] = value;
+    }
+};
+
+// ============================================================
+// MBC2 — up to 256KB ROM / 512×4-bit internal RAM
+// ============================================================
+const Mbc2 = struct {
+    rom_bank: u8 = 1,
+    ram_enabled: bool = false,
+    rom_bank_count: u16,
+    ram: [512]u8 = .{0} ** 512, // 512 × 4-bit (only lower nibble used)
+
+    pub fn init(rom_size: usize) Mbc2 {
+        const bank_count: u16 = @intCast(@max(2, rom_size / 0x4000));
+        return Mbc2{ .rom_bank_count = bank_count };
+    }
+
+    pub fn read_rom(self: *Mbc2, rom: []const u8, address: u16) u8 {
+        switch (address) {
+            0x0000...0x3FFF => return rom[address],
+            0x4000...0x7FFF => {
+                const bank: u32 = @as(u32, self.rom_bank) % self.rom_bank_count;
+                const offset = bank * 0x4000 + (address - 0x4000);
+                if (offset < rom.len) return rom[offset];
+                return 0xFF;
+            },
+            else => return 0xFF,
+        }
+    }
+
+    pub fn read_ram(self: *Mbc2, address: u16) u8 {
+        if (!self.ram_enabled) return 0xFF;
+        // MBC2 RAM is 512 bytes at 0xA000-0xA1FF, mirrored across 0xA000-0xBFFF
+        const offset = (address - 0xA000) & 0x1FF;
+        return self.ram[offset] | 0xF0; // upper nibble reads as 1s
+    }
+
+    pub fn write_rom(self: *Mbc2, address: u16, value: u8) void {
+        switch (address) {
+            // Bit 8 of address distinguishes RAM enable vs ROM bank
+            0x0000...0x3FFF => {
+                if (address & 0x0100 == 0) {
+                    // RAM enable (bit 8 == 0)
+                    self.ram_enabled = (value & 0x0F) == 0x0A;
+                } else {
+                    // ROM bank (bit 8 == 1)
+                    var bank = value & 0x0F;
+                    if (bank == 0) bank = 1;
+                    self.rom_bank = bank;
+                }
+            },
+            else => {},
+        }
+    }
+
+    pub fn write_ram(self: *Mbc2, address: u16, value: u8) void {
+        if (!self.ram_enabled) return;
+        const offset = (address - 0xA000) & 0x1FF;
+        self.ram[offset] = value & 0x0F; // only lower 4 bits stored
     }
 };
 

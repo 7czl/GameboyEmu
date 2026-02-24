@@ -444,7 +444,6 @@ pub const Ppu = struct {
         switch (self.mode) {
             .OAMScan => {
                 if (self.cycle_counter == 1) {
-                    self.check_lyc(bus);
                     if (self.ly == self.wy) {
                         self.wy_latch = true;
                     }
@@ -480,8 +479,15 @@ pub const Ppu = struct {
                 if (self.cycle_counter >= 456) {
                     self.cycle_counter = 0;
                     self.ly += 1;
+                    // Reset IRQ line to allow new rising edge on mode transition
+                    self.stat_irq_line = false;
                     if (self.ly >= 144) {
                         self.mode = .VBlank;
+                        if (self.ly == self.lyc) {
+                            self.stat |= 0x04;
+                        } else {
+                            self.stat &= ~@as(u8, 0x04);
+                        }
                         self.set_mode(bus);
                         bus.request_interrupt(.VBlank);
                         if (self.display) |disp| {
@@ -489,24 +495,34 @@ pub const Ppu = struct {
                         }
                     } else {
                         self.mode = .OAMScan;
+                        if (self.ly == self.lyc) {
+                            self.stat |= 0x04;
+                        } else {
+                            self.stat &= ~@as(u8, 0x04);
+                        }
                         self.set_mode(bus);
                     }
                 }
             },
             .VBlank => {
-                if (self.cycle_counter == 1) {
-                    self.check_lyc(bus);
-                }
                 if (self.cycle_counter >= 456) {
                     self.cycle_counter = 0;
                     self.ly += 1;
+                    self.stat_irq_line = false;
                     if (self.ly > 153) {
                         self.ly = 0;
                         self.window_line_counter = 0;
                         self.window_was_active = false;
                         self.wy_latch = false;
                         self.mode = .OAMScan;
+                        if (self.ly == self.lyc) {
+                            self.stat |= 0x04;
+                        } else {
+                            self.stat &= ~@as(u8, 0x04);
+                        }
                         self.set_mode(bus);
+                    } else {
+                        self.check_lyc(bus);
                     }
                 }
             },
