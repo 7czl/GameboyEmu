@@ -109,13 +109,21 @@ pub const CPU = struct {
         return cycles;
     }
 
-    /// Tick timer and PPU by the given number of T-cycles
+    /// Tick timer and PPU by the given number of T-cycles.
+    /// In CGB double speed mode, the CPU runs at 2x but PPU and APU
+    /// run at normal speed (half the T-cycles). The timer is clocked
+    /// by the CPU clock, so it always receives full T-cycles.
     fn tick(self: *CPU, bus: *Bus, t_cycles: u32) void {
         self.cycles += t_cycles;
         self.ticked_cycles += t_cycles;
+        // Timer is driven by CPU clock — always gets full T-cycles
         bus.timer.step(bus, @intCast(t_cycles));
-        bus.ppu.step(bus, @intCast(t_cycles));
-        bus.apu.step(t_cycles, bus.timer.div_counter);
+        // PPU and APU run at normal speed
+        const peripheral_cycles: u32 = if (bus.double_speed) t_cycles / 2 else t_cycles;
+        if (peripheral_cycles > 0) {
+            bus.ppu.step(bus, @intCast(peripheral_cycles));
+            bus.apu.step(peripheral_cycles, bus.timer.div_counter, bus.double_speed);
+        }
     }
 
     /// CPU-facing read: read memory then tick 1 M-cycle
@@ -284,12 +292,14 @@ pub const CPU = struct {
                 return 4;
             },
             0x10 => { // STOP
-                self.pc += 2; // 注意这里是2
+                self.pc += 2;
                 // CGB: if speed switch is armed, toggle double speed
                 if (bus.cgb_mode and bus.speed_switch_armed) {
                     bus.double_speed = !bus.double_speed;
                     bus.speed_switch_armed = false;
-                    // Speed switch takes ~8200 T-cycles, tick 4 at a time
+                    // Speed switch resets DIV
+                    bus.timer.div_counter = 0;
+                    // Speed switch takes ~8200 T-cycles
                     var remaining: u32 = 8200;
                     while (remaining >= 4) {
                         self.tick(bus, 4);
