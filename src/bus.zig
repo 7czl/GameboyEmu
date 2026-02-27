@@ -283,9 +283,13 @@ pub const Bus = struct {
             0xFF43 => {
                 self.ppu.scx = value;
             },
-            0xFF44 => {},
+            0xFF44 => {
+                self.ppu.ly = 0;
+                self.ppu.check_lyc(self);
+            },
             0xFF45 => {
                 self.ppu.lyc = value;
+                self.ppu.check_lyc(self);
             },
             0xFF46 => {
                 self.dma_transfer(value);

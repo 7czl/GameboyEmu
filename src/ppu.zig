@@ -154,7 +154,7 @@ pub const Ppu = struct {
         self.stat = (self.stat & 0xFC) | @intFromEnum(self.mode);
         self.update_stat_irq(bus);
     }
-    fn check_lyc(self: *Ppu, bus: *Bus) void {
+    pub fn check_lyc(self: *Ppu, bus: *Bus) void {
         if (self.ly == self.lyc) {
             self.stat |= 0x04;
         } else {
@@ -405,6 +405,7 @@ pub const Ppu = struct {
                     self.fetcher_state = .read_tile_id;
                     self.fetcher_ticks = 0;
                     self.initial_fetch_done = false;
+                    self.scx_discard = 0;
                     return;
                 }
             }
