@@ -211,6 +211,7 @@ pub fn main() !void {
 fn run_headless(cpu: *Cpu, bus: *Bus, max_cycles: u64) void {
     std.log.info("--- start emulation loop (headless) ---", .{});
 
+    const start_ns = std.time.nanoTimestamp();
     var last_check: u64 = 0;
     while (max_cycles == 0 or cpu.cycles < max_cycles) {
         _ = cpu.step(bus);
@@ -218,12 +219,28 @@ fn run_headless(cpu: *Cpu, bus: *Bus, max_cycles: u64) void {
         // Check $A000 memory-mapped test output every ~1 frame (70224 cycles)
         if (max_cycles != 0 and cpu.cycles - last_check >= 70224) {
             last_check = cpu.cycles;
-            if (check_memory_output(bus)) return;
+            if (check_memory_output(bus)) break;
         }
     }
 
     // Also check at end of max_cycles
     _ = check_memory_output(bus);
+
+    // Performance report
+    const end_ns = std.time.nanoTimestamp();
+    const elapsed_ns: u64 = @intCast(end_ns - start_ns);
+    const elapsed_ms = elapsed_ns / 1_000_000;
+    const cycles = cpu.cycles;
+    // GB CPU runs at 4.194304 MHz; real time for N cycles = N / 4194304 seconds
+    const real_time_ms = cycles * 1000 / 4_194_304;
+    const speedup = if (elapsed_ms > 0) real_time_ms * 100 / elapsed_ms else 0;
+    std.log.info("Performance: {d} cycles in {d}ms (GB real time: {d}ms, speed: {d}.{d:0>2}x)", .{
+        cycles,
+        elapsed_ms,
+        real_time_ms,
+        speedup / 100,
+        speedup % 100,
+    });
 }
 
 /// Check Blargg $A000 memory-mapped test output. Returns true if test finished.
@@ -325,7 +342,7 @@ fn run_with_sdl(cpu: *Cpu, bus: *Bus, display: *Display, joypad: *Joypad) !void 
                 const sym = event.key.keysym.sym;
                 if (pressed) {
                     // F11: toggle fullscreen
-                    if (sym == c.SDLK_F11) {
+                    if (sym == c.SDLK_F5) {
                         const flags = c.SDL_GetWindowFlags(window);
                         if (flags & c.SDL_WINDOW_FULLSCREEN_DESKTOP != 0) {
                             _ = c.SDL_SetWindowFullscreen(window, 0);
