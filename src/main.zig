@@ -283,7 +283,7 @@ fn run_with_sdl(cpu: *Cpu, bus: *Bus, display: *Display, joypad: *Joypad) !void 
         c.SDL_WINDOWPOS_CENTERED,
         160 * SCALE,
         144 * SCALE,
-        c.SDL_WINDOW_SHOWN,
+        c.SDL_WINDOW_SHOWN | c.SDL_WINDOW_RESIZABLE,
     ) orelse return error.SDLWindowFailed;
     defer c.SDL_DestroyWindow(window);
 
@@ -293,6 +293,11 @@ fn run_with_sdl(cpu: *Cpu, bus: *Bus, display: *Display, joypad: *Joypad) !void 
         c.SDL_RENDERER_ACCELERATED | c.SDL_RENDERER_PRESENTVSYNC,
     ) orelse return error.SDLRendererFailed;
     defer c.SDL_DestroyRenderer(renderer);
+
+    // Nearest-neighbor scaling for crisp pixels
+    _ = c.SDL_SetHint(c.SDL_HINT_RENDER_SCALE_QUALITY, "0");
+    // Maintain aspect ratio with black bars (letterboxing)
+    _ = c.SDL_RenderSetLogicalSize(renderer, 160, 144);
 
     const texture = c.SDL_CreateTexture(
         renderer,
@@ -317,10 +322,29 @@ fn run_with_sdl(cpu: *Cpu, bus: *Bus, display: *Display, joypad: *Joypad) !void 
                 running = false;
             } else if (event.type == c.SDL_KEYDOWN or event.type == c.SDL_KEYUP) {
                 const pressed = event.type == c.SDL_KEYDOWN;
-                const key = sdl_to_gb_key(event.key.keysym.sym);
+                const sym = event.key.keysym.sym;
+                if (pressed) {
+                    // F11: toggle fullscreen
+                    if (sym == c.SDLK_F11) {
+                        const flags = c.SDL_GetWindowFlags(window);
+                        if (flags & c.SDL_WINDOW_FULLSCREEN_DESKTOP != 0) {
+                            _ = c.SDL_SetWindowFullscreen(window, 0);
+                        } else {
+                            _ = c.SDL_SetWindowFullscreen(window, c.SDL_WINDOW_FULLSCREEN_DESKTOP);
+                        }
+                    }
+                    // 1-5: integer scale
+                    if (sym >= c.SDLK_1 and sym <= c.SDLK_5) {
+                        const scale: c_int = sym - c.SDLK_1 + 1;
+                        _ = c.SDL_SetWindowFullscreen(window, 0);
+                        c.SDL_SetWindowSize(window, 160 * scale, 144 * scale);
+                        c.SDL_SetWindowPosition(window, c.SDL_WINDOWPOS_CENTERED, c.SDL_WINDOWPOS_CENTERED);
+                    }
+                }
+                const key = sdl_to_gb_key(sym);
                 if (key) |k| {
                     joypad.set_key(k, pressed);
-                } else if (event.key.keysym.sym == c.SDLK_ESCAPE) {
+                } else if (sym == c.SDLK_ESCAPE) {
                     running = false;
                 }
             }
