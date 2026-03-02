@@ -193,7 +193,21 @@ pub fn main() !void {
     // Save battery-backed RAM on exit
     if (battery and sav_path_len > 0) {
         const sav_path = sav_path_buf[0..sav_path_len];
-        if (bus.mbc.get_ram_data()) |ram_data| {
+        // For MBC3 with RTC, save RAM + RTC state together
+        if (bus.mbc.has_rtc()) {
+            if (bus.mbc.get_save_data_with_rtc(allocator)) |save_data| {
+                defer allocator.free(save_data);
+                if (std.fs.cwd().createFile(sav_path, .{})) |sav_file| {
+                    defer sav_file.close();
+                    sav_file.writeAll(save_data) catch |err| {
+                        std.log.err("Failed to write save: {}", .{err});
+                    };
+                    std.log.info("Saved to: {s} (with RTC)", .{sav_path});
+                } else |err| {
+                    std.log.err("Failed to create save file: {}", .{err});
+                }
+            }
+        } else if (bus.mbc.get_ram_data()) |ram_data| {
             if (std.fs.cwd().createFile(sav_path, .{})) |sav_file| {
                 defer sav_file.close();
                 sav_file.writeAll(ram_data) catch |err| {

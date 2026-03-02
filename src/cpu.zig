@@ -118,6 +118,8 @@ pub const CPU = struct {
         self.ticked_cycles += t_cycles;
         // Timer is driven by CPU clock — always gets full T-cycles
         bus.timer.step(bus, @intCast(t_cycles));
+        // RTC ticks at CPU clock rate (always full T-cycles, not affected by double speed)
+        bus.mbc.tick_rtc(t_cycles);
         // PPU and APU run at normal speed
         const peripheral_cycles: u32 = if (bus.double_speed) t_cycles / 2 else t_cycles;
         if (peripheral_cycles > 0) {

@@ -116,14 +116,49 @@ pub const Mbc = union(MbcType) {
                 @memcpy(m.ram[0..len], data[0..len]);
             },
             .mbc3 => |*m| {
-                const len = @min(data.len, m.ram.len);
-                @memcpy(m.ram[0..len], data[0..len]);
+                const ram_len = @min(data.len, m.ram.len);
+                @memcpy(m.ram[0..ram_len], data[0..ram_len]);
+                // Load RTC state appended after RAM (48 bytes)
+                if (data.len >= m.ram.len + 48) {
+                    m.load_rtc_save_data(data[m.ram.len .. m.ram.len + 48]);
+                }
             },
             .mbc5 => |*m| {
                 const len = @min(data.len, m.ram.len);
                 @memcpy(m.ram[0..len], data[0..len]);
             },
         }
+    }
+
+    /// Tick RTC for MBC3 cartridges
+    pub fn tick_rtc(self: *Mbc, t_cycles: u32) void {
+        switch (self.*) {
+            .mbc3 => |*m| m.tick_rtc(t_cycles),
+            else => {},
+        }
+    }
+
+    /// Check if this MBC has an RTC
+    pub fn has_rtc(self: *Mbc) bool {
+        return switch (self.*) {
+            .mbc3 => true,
+            else => false,
+        };
+    }
+
+    /// Get save data including RTC state for MBC3
+    pub fn get_save_data_with_rtc(self: *Mbc, allocator: std.mem.Allocator) ?[]u8 {
+        return switch (self.*) {
+            .mbc3 => |*m| {
+                const rtc_data = m.get_rtc_save_data();
+                const total = m.ram.len + 48;
+                const buf = allocator.alloc(u8, total) catch return null;
+                @memcpy(buf[0..m.ram.len], &m.ram);
+                @memcpy(buf[m.ram.len..total], &rtc_data);
+                return buf;
+            },
+            else => null,
+        };
     }
 };
 
@@ -289,16 +324,88 @@ const Mbc3 = struct {
     ram_enabled: bool = false,
     rom_bank_count: u16,
     ram: [4 * 8192]u8 = .{0} ** (4 * 8192),
-    // RTC registers (simplified — no latching)
+
+    // RTC live registers (ticking)
     rtc_s: u8 = 0,
     rtc_m: u8 = 0,
     rtc_h: u8 = 0,
     rtc_dl: u8 = 0,
-    rtc_dh: u8 = 0,
+    rtc_dh: u8 = 0, // bit 0 = day counter MSB, bit 6 = halt, bit 7 = day overflow
+
+    // RTC latched registers (snapshot when latch triggered)
+    latched_s: u8 = 0,
+    latched_m: u8 = 0,
+    latched_h: u8 = 0,
+    latched_dl: u8 = 0,
+    latched_dh: u8 = 0,
+
+    // Latch state: need 0x00 then 0x01 write to latch
+    latch_ready: bool = false,
+
+    // Sub-second counter: counts CPU T-cycles (4194304 per second)
+    rtc_cycles: u32 = 0,
+
+    // Timestamp of last save (for calculating elapsed time on load)
+    rtc_timestamp: i64 = 0,
+
+    const CYCLES_PER_SECOND: u32 = 4194304;
 
     pub fn init(rom_size: usize) Mbc3 {
         const bank_count: u16 = @intCast(@max(2, rom_size / 0x4000));
-        return Mbc3{ .rom_bank_count = bank_count };
+        return Mbc3{ .rom_bank_count = bank_count, .rtc_timestamp = std.time.timestamp() };
+    }
+
+    /// Advance RTC by the given number of T-cycles
+    pub fn tick_rtc(self: *Mbc3, t_cycles: u32) void {
+        // Don't tick if halted
+        if (self.rtc_dh & 0x40 != 0) return;
+
+        self.rtc_cycles += t_cycles;
+        while (self.rtc_cycles >= CYCLES_PER_SECOND) {
+            self.rtc_cycles -= CYCLES_PER_SECOND;
+            self.increment_rtc_second();
+        }
+    }
+
+    fn increment_rtc_second(self: *Mbc3) void {
+        self.rtc_s +%= 1;
+        if (self.rtc_s < 60) return;
+        self.rtc_s = 0;
+
+        self.rtc_m +%= 1;
+        if (self.rtc_m < 60) return;
+        self.rtc_m = 0;
+
+        self.rtc_h +%= 1;
+        if (self.rtc_h < 24) return;
+        self.rtc_h = 0;
+
+        // Increment 9-bit day counter (DL = low 8, DH bit 0 = high bit)
+        var days: u16 = @as(u16, self.rtc_dl) | (@as(u16, self.rtc_dh & 1) << 8);
+        days +%= 1;
+        if (days > 511) {
+            days = 0;
+            self.rtc_dh |= 0x80; // set day overflow flag
+        }
+        self.rtc_dl = @truncate(days & 0xFF);
+        self.rtc_dh = (self.rtc_dh & 0xFE) | @as(u8, @truncate((days >> 8) & 1));
+    }
+
+    /// Apply elapsed real-world seconds to RTC (used when loading save)
+    pub fn advance_rtc_seconds(self: *Mbc3, seconds: u64) void {
+        if (self.rtc_dh & 0x40 != 0) return; // halted
+        var remaining = seconds;
+        while (remaining > 0) : (remaining -= 1) {
+            self.increment_rtc_second();
+        }
+    }
+
+    fn latch_rtc(self: *Mbc3) void {
+        self.latched_s = self.rtc_s;
+        self.latched_m = self.rtc_m;
+        self.latched_h = self.rtc_h;
+        self.latched_dl = self.rtc_dl;
+        self.latched_dh = self.rtc_dh;
     }
 
     pub fn read_rom(self: *Mbc3, rom: []const u8, address: u16) u8 {
@@ -321,13 +428,13 @@ const Mbc3 = struct {
             if (offset < self.ram.len) return self.ram[offset];
             return 0xFF;
         }
-        // RTC register read
+        // RTC register read — returns latched values
         return switch (self.ram_bank) {
-            0x08 => self.rtc_s,
-            0x09 => self.rtc_m,
-            0x0A => self.rtc_h,
-            0x0B => self.rtc_dl,
-            0x0C => self.rtc_dh,
+            0x08 => self.latched_s,
+            0x09 => self.latched_m,
+            0x0A => self.latched_h,
+            0x0B => self.latched_dl,
+            0x0C => self.latched_dh,
             else => 0xFF,
         };
     }
@@ -346,7 +453,15 @@ const Mbc3 = struct {
                 self.ram_bank = value;
             },
             0x6000...0x7FFF => {
-                // RTC latch — simplified, no-op for now
+                // RTC latch: write 0x00 then 0x01 to latch current time
+                if (value == 0x00) {
+                    self.latch_ready = true;
+                } else if (value == 0x01 and self.latch_ready) {
+                    self.latch_rtc();
+                    self.latch_ready = false;
+                } else {
+                    self.latch_ready = false;
+                }
             },
             else => {},
         }
@@ -358,16 +473,64 @@ const Mbc3 = struct {
             const offset = @as(u32, self.ram_bank) * 0x2000 + (address - 0xA000);
             if (offset < self.ram.len) self.ram[offset] = value;
         } else {
-            // RTC register write
+            // RTC register write — writes to live registers
             switch (self.ram_bank) {
-                0x08 => self.rtc_s = value,
-                0x09 => self.rtc_m = value,
-                0x0A => self.rtc_h = value,
+                0x08 => {
+                    self.rtc_s = value & 0x3F;
+                    self.rtc_cycles = 0; // reset sub-second counter
+                },
+                0x09 => self.rtc_m = value & 0x3F,
+                0x0A => self.rtc_h = value & 0x1F,
                 0x0B => self.rtc_dl = value,
-                0x0C => self.rtc_dh = value,
+                0x0C => self.rtc_dh = value & 0xC1, // only bits 0, 6, 7 are meaningful
                 else => {},
             }
         }
+    }
+
+    /// Get RTC state as 48 bytes for save file (compatible with VBA/BGB format)
+    /// Format: 5 × u32 current regs + 5 × u32 latched regs + i64 timestamp
+    pub fn get_rtc_save_data(self: *Mbc3) [48]u8 {
+        var buf: [48]u8 = .{0} ** 48;
+        // Current registers (little-endian u32 each)
+        std.mem.writeInt(u32, buf[0..4], self.rtc_s, .little);
+        std.mem.writeInt(u32, buf[4..8], self.rtc_m, .little);
+        std.mem.writeInt(u32, buf[8..12], self.rtc_h, .little);
+        std.mem.writeInt(u32, buf[12..16], self.rtc_dl, .little);
+        std.mem.writeInt(u32, buf[16..20], self.rtc_dh, .little);
+        // Latched registers
+        std.mem.writeInt(u32, buf[20..24], self.latched_s, .little);
+        std.mem.writeInt(u32, buf[24..28], self.latched_m, .little);
+        std.mem.writeInt(u32, buf[28..32], self.latched_h, .little);
+        std.mem.writeInt(u32, buf[32..36], self.latched_dl, .little);
+        std.mem.writeInt(u32, buf[36..40], self.latched_dh, .little);
+        // Unix timestamp
+        const ts: i64 = std.time.timestamp();
+        std.mem.writeInt(i64, buf[40..48], ts, .little);
+        return buf;
+    }
+
+    /// Load RTC state from save file data and advance by elapsed real time
+    pub fn load_rtc_save_data(self: *Mbc3, data: []const u8) void {
+        if (data.len < 48) return;
+        self.rtc_s = @truncate(std.mem.readInt(u32, data[0..4], .little));
+        self.rtc_m = @truncate(std.mem.readInt(u32, data[4..8], .little));
+        self.rtc_h = @truncate(std.mem.readInt(u32, data[8..12], .little));
+        self.rtc_dl = @truncate(std.mem.readInt(u32, data[12..16], .little));
+        self.rtc_dh = @truncate(std.mem.readInt(u32, data[16..20], .little));
+        self.latched_s = @truncate(std.mem.readInt(u32, data[20..24], .little));
+        self.latched_m = @truncate(std.mem.readInt(u32, data[24..28], .little));
+        self.latched_h = @truncate(std.mem.readInt(u32, data[28..32], .little));
+        self.latched_dl = @truncate(std.mem.readInt(u32, data[32..36], .little));
+        self.latched_dh = @truncate(std.mem.readInt(u32, data[36..40], .little));
+        const saved_ts = std.mem.readInt(i64, data[40..48], .little);
+        // Advance RTC by elapsed real-world time since save
+        const now = std.time.timestamp();
+        if (now > saved_ts) {
+            const elapsed: u64 = @intCast(now - saved_ts);
+            self.advance_rtc_seconds(elapsed);
+        }
+        self.rtc_timestamp = now;
     }
 };
 
