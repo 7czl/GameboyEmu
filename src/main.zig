@@ -7,6 +7,7 @@ const Display = @import("display.zig").Display;
 const Joypad = @import("joypad.zig").Joypad;
 const Apu = @import("apu.zig").Apu;
 const Mbc = @import("mbc.zig").Mbc;
+const savestate = @import("savestate.zig");
 const posix = std.posix;
 const c = @cImport({
     @cInclude("SDL.h");
@@ -199,10 +200,39 @@ pub fn main() !void {
         bus.io_registers[0x46] = 0xFF; // DMA
     }
 
+    // Compute save state file path (.ss0)
+    var state_path_buf: [512]u8 = undefined;
+    var state_path_len: usize = 0;
+    {
+        var base_len = rom_path.len;
+        // Strip extension
+        const lower3 = if (base_len > 3) blk: {
+            var buf3: [3]u8 = undefined;
+            for (rom_path[base_len - 3 ..][0..3], 0..) |ch, idx| buf3[idx] = std.ascii.toLower(ch);
+            break :blk buf3;
+        } else [3]u8{ 0, 0, 0 };
+        const lower4 = if (base_len > 4) blk: {
+            var buf4: [4]u8 = undefined;
+            for (rom_path[base_len - 4 ..][0..4], 0..) |ch, idx| buf4[idx] = std.ascii.toLower(ch);
+            break :blk buf4;
+        } else [4]u8{ 0, 0, 0, 0 };
+        if (base_len > 3 and std.mem.eql(u8, &lower3, ".gb")) {
+            base_len -= 3;
+        } else if (base_len > 4 and std.mem.eql(u8, &lower4, ".gbc")) {
+            base_len -= 4;
+        }
+        const ext = ".ss0";
+        if (base_len + ext.len <= state_path_buf.len) {
+            @memcpy(state_path_buf[0..base_len], rom_path[0..base_len]);
+            @memcpy(state_path_buf[base_len .. base_len + ext.len], ext);
+            state_path_len = base_len + ext.len;
+        }
+    }
+
     if (headless) {
         run_headless(&cpu, &bus, max_cycles);
     } else {
-        try run_with_sdl(&cpu, &bus, &display, &joypad, allocator, if (battery and sav_path_len > 0) sav_path_buf[0..sav_path_len] else null);
+        try run_with_sdl(&cpu, &bus, &display, &joypad, allocator, if (battery and sav_path_len > 0) sav_path_buf[0..sav_path_len] else null, if (state_path_len > 0) state_path_buf[0..state_path_len] else null);
     }
 
     // Save battery-backed RAM on exit
@@ -299,7 +329,7 @@ fn check_memory_output(bus: *Bus) bool {
 }
 
 /// SDL mode: run with display window and input handling
-fn run_with_sdl(cpu: *Cpu, bus: *Bus, display: *Display, joypad: *Joypad, allocator: std.mem.Allocator, sav_path: ?[]const u8) !void {
+fn run_with_sdl(cpu: *Cpu, bus: *Bus, display: *Display, joypad: *Joypad, allocator: std.mem.Allocator, sav_path: ?[]const u8, state_path: ?[]const u8) !void {
     // Initialize SDL (video + audio)
     if (c.SDL_Init(c.SDL_INIT_VIDEO | c.SDL_INIT_AUDIO) != 0) {
         std.log.err("SDL_Init failed: {s}", .{c.SDL_GetError()});
@@ -372,8 +402,39 @@ fn run_with_sdl(cpu: *Cpu, bus: *Bus, display: *Display, joypad: *Joypad, alloca
                 const pressed = event.type == c.SDL_KEYDOWN;
                 const sym = event.key.keysym.sym;
                 if (pressed) {
-                    // F11: toggle fullscreen
+                    // F5: save state
                     if (sym == c.SDLK_F5) {
+                        if (state_path) |sp| {
+                            if (savestate.save(allocator, cpu, bus)) |data| {
+                                defer allocator.free(data);
+                                if (std.fs.cwd().createFile(sp, .{})) |f| {
+                                    defer f.close();
+                                    f.writeAll(data) catch {};
+                                    std.log.info("State saved to: {s}", .{sp});
+                                } else |_| {}
+                            }
+                        }
+                    }
+                    // F8: load state
+                    if (sym == c.SDLK_F8) {
+                        if (state_path) |sp| {
+                            if (std.fs.cwd().openFile(sp, .{ .mode = .read_only })) |f| {
+                                defer f.close();
+                                if (f.readToEndAlloc(allocator, 4 * 1024 * 1024)) |data| {
+                                    defer allocator.free(data);
+                                    if (savestate.load(data, cpu, bus)) {
+                                        std.log.info("State loaded from: {s}", .{sp});
+                                    } else {
+                                        std.log.err("Invalid save state: {s}", .{sp});
+                                    }
+                                } else |_| {}
+                            } else |_| {
+                                std.log.warn("No save state found: {s}", .{sp});
+                            }
+                        }
+                    }
+                    // F11: toggle fullscreen
+                    if (sym == c.SDLK_F11) {
                         const flags = c.SDL_GetWindowFlags(window);
                         if (flags & c.SDL_WINDOW_FULLSCREEN_DESKTOP != 0) {
                             _ = c.SDL_SetWindowFullscreen(window, 0);
