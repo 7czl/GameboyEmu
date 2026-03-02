@@ -391,6 +391,8 @@ fn run_with_sdl(cpu: *Cpu, bus: *Bus, display: *Display, joypad: *Joypad, alloca
     var excess_cycles: u32 = 0;
     var frame_count: u32 = 0;
     const save_interval: u32 = 60; // auto-save check every ~1 second
+    var fast_forward = false;
+    const ff_multiplier: u32 = 4; // run 4x frames when fast-forwarding
 
     while (running) {
         // Poll SDL events
@@ -455,17 +457,27 @@ fn run_with_sdl(cpu: *Cpu, bus: *Bus, display: *Display, joypad: *Joypad, alloca
                     joypad.set_key(k, pressed);
                 } else if (sym == c.SDLK_ESCAPE) {
                     running = false;
+                } else if (sym == c.SDLK_SPACE) {
+                    fast_forward = pressed;
+                    if (pressed and audio_dev != 0) {
+                        // Clear audio queue to avoid lag when entering fast-forward
+                        c.SDL_ClearQueuedAudio(audio_dev);
+                    }
                 }
             }
         }
 
-        // Run one frame, accounting for excess cycles from previous frame
-        var frame_cycles: u32 = excess_cycles;
-        while (frame_cycles < cycles_per_frame) {
-            const step_cycles = cpu.step(bus);
-            frame_cycles += step_cycles;
+        // Run one frame (or multiple when fast-forwarding)
+        const frames_to_run: u32 = if (fast_forward) ff_multiplier else 1;
+        var ff_i: u32 = 0;
+        while (ff_i < frames_to_run) : (ff_i += 1) {
+            var frame_cycles: u32 = excess_cycles;
+            while (frame_cycles < cycles_per_frame) {
+                const step_cycles = cpu.step(bus);
+                frame_cycles += step_cycles;
+            }
+            excess_cycles = frame_cycles - cycles_per_frame;
         }
-        excess_cycles = frame_cycles - cycles_per_frame;
 
         // Present frame if ready
         if (display.frame_ready) {
@@ -484,17 +496,18 @@ fn run_with_sdl(cpu: *Cpu, bus: *Bus, display: *Display, joypad: *Joypad, alloca
         // Push audio samples and throttle to ~59.7 fps via audio sync
         if (audio_dev != 0) {
             const samples = bus.apu.get_samples();
-            if (samples.len > 0) {
+            if (!fast_forward and samples.len > 0) {
                 _ = c.SDL_QueueAudio(
                     audio_dev,
                     @ptrCast(samples.ptr),
                     @intCast(samples.len * @sizeOf(i16)),
                 );
             }
-            // Throttle: wait until audio buffer drains below ~2 frames worth
-            // 44100 Hz / 59.7 fps ≈ 739 samples/frame, 2 frames ≈ 1478 samples * 2 bytes
-            while (c.SDL_GetQueuedAudioSize(audio_dev) > 1478 * 2 * 2) {
-                c.SDL_Delay(1);
+            // Throttle: wait until audio buffer drains (skip during fast-forward)
+            if (!fast_forward) {
+                while (c.SDL_GetQueuedAudioSize(audio_dev) > 1478 * 2 * 2) {
+                    c.SDL_Delay(1);
+                }
             }
         }
 
