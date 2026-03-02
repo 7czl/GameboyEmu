@@ -97,9 +97,23 @@ pub fn main() !void {
         // Replace .gb/.gbc extension with .sav
         const rom_name = rom_path;
         var base_len = rom_name.len;
-        if (base_len > 3 and (std.mem.eql(u8, rom_name[base_len - 3 ..], ".gb"))) {
+        const lower3 = if (base_len > 3) blk: {
+            var buf: [3]u8 = undefined;
+            for (rom_name[base_len - 3 ..][0..3], 0..) |ch, idx| {
+                buf[idx] = std.ascii.toLower(ch);
+            }
+            break :blk buf;
+        } else [3]u8{ 0, 0, 0 };
+        const lower4 = if (base_len > 4) blk: {
+            var buf: [4]u8 = undefined;
+            for (rom_name[base_len - 4 ..][0..4], 0..) |ch, idx| {
+                buf[idx] = std.ascii.toLower(ch);
+            }
+            break :blk buf;
+        } else [4]u8{ 0, 0, 0, 0 };
+        if (base_len > 3 and std.mem.eql(u8, &lower3, ".gb")) {
             base_len -= 3;
-        } else if (base_len > 4 and (std.mem.eql(u8, rom_name[base_len - 4 ..], ".gbc"))) {
+        } else if (base_len > 4 and std.mem.eql(u8, &lower4, ".gbc")) {
             base_len -= 4;
         }
         const ext = ".sav";
@@ -110,6 +124,7 @@ pub fn main() !void {
 
             // Try to load existing save
             const sav_path = sav_path_buf[0..sav_path_len];
+            std.log.info("Save file path: {s}", .{sav_path});
             if (std.fs.cwd().openFile(sav_path, .{ .mode = .read_only })) |sav_file| {
                 defer sav_file.close();
                 const sav_data = sav_file.readToEndAlloc(allocator, 128 * 1024) catch null;
