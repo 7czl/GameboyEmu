@@ -84,7 +84,7 @@ pub fn main() !void {
     ppu.display = &display;
     var timer = Timer.init();
     var joypad = Joypad.init();
-    var apu = Apu.init();
+    var apu = Apu.init(!force_dmg and rom_bytes.len > 0x143 and (rom_bytes[0x143] == 0x80 or rom_bytes[0x143] == 0xC0));
     var bus = Bus.init(rom_bytes, boot_rom_bytes, &timer, &ppu, &joypad, &apu, force_dmg);
     var cpu = Cpu.init();
 

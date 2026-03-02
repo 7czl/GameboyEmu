@@ -17,6 +17,7 @@ pub const Apu = struct {
     enabled: bool = true,
     nr50: u8 = 0x77,
     nr51: u8 = 0xF3,
+    cgb_mode: bool = false,
 
     ch1: PulseChannel = .{},
     ch1_sweep_period: u8 = 0,
@@ -38,6 +39,7 @@ pub const Apu = struct {
     ch3_timer: u16 = 0,
     ch3_position: u8 = 0,
     ch3_sample_buffer: u8 = 0,
+    ch3_wave_recently_read: u8 = 0, // countdown: >0 means CH3 recently read wave RAM
     wave_ram: [16]u8 = .{0} ** 16,
 
     ch4_enabled: bool = false,
@@ -62,8 +64,8 @@ pub const Apu = struct {
     sample_buffer: [4096]i16 = .{0} ** 4096,
     sample_count: u32 = 0,
 
-    pub fn init() Apu {
-        return Apu{};
+    pub fn init(cgb_mode: bool) Apu {
+        return Apu{ .cgb_mode = cgb_mode };
     }
 
     pub fn step(self: *Apu, t_cycles: u32, div_counter: u16, double_speed: bool) void {
@@ -80,6 +82,8 @@ pub const Apu = struct {
 
         var i: u32 = 0;
         while (i < t_cycles) : (i += 1) {
+            // Decrement wave access countdown each T-cycle
+            if (self.ch3_wave_recently_read > 0) self.ch3_wave_recently_read -= 1;
             if (self.enabled) {
                 self.ch1.tick_timer();
                 self.ch2.tick_timer();
@@ -199,6 +203,7 @@ pub const Apu = struct {
             self.ch3_position = (self.ch3_position + 1) & 31;
             const byte = self.wave_ram[self.ch3_position >> 1];
             self.ch3_sample_buffer = if (self.ch3_position & 1 == 0) (byte >> 4) else (byte & 0x0F);
+            self.ch3_wave_recently_read = 2; // accessible for ~2 T-cycles
         }
     }
 
@@ -289,8 +294,17 @@ pub const Apu = struct {
             0xFF27...0xFF2F => 0xFF,
             0xFF30...0xFF3F => {
                 if (self.ch3_enabled) {
-                    // When CH3 is active, reads return the byte currently being played
-                    return self.wave_ram[self.ch3_position >> 1];
+                    // When CH3 is active:
+                    // CGB: always returns the byte at current position
+                    // DMG: only returns it if accessed on the same cycle CH3 reads, else 0xFF
+                    if (self.cgb_mode) {
+                        return self.wave_ram[self.ch3_position >> 1];
+                    } else {
+                        if (self.ch3_wave_recently_read > 0) {
+                            return self.wave_ram[self.ch3_position >> 1];
+                        }
+                        return 0xFF;
+                    }
                 }
                 return self.wave_ram[address - 0xFF30];
             },
@@ -299,10 +313,18 @@ pub const Apu = struct {
     }
 
     pub fn write(self: *Apu, address: u16, value: u8) void {
-        // Wave RAM is always accessible
+        // Wave RAM is always accessible when CH3 is off
         if (address >= 0xFF30 and address <= 0xFF3F) {
             if (self.ch3_enabled) {
-                self.wave_ram[self.ch3_position >> 1] = value;
+                // CGB: writes go to the byte at current position
+                // DMG: only works if on the same cycle CH3 reads, else ignored
+                if (self.cgb_mode) {
+                    self.wave_ram[self.ch3_position >> 1] = value;
+                } else {
+                    if (self.ch3_wave_recently_read > 0) {
+                        self.wave_ram[self.ch3_position >> 1] = value;
+                    }
+                }
             } else {
                 self.wave_ram[address - 0xFF30] = value;
             }
@@ -319,9 +341,20 @@ pub const Apu = struct {
             }
             return;
         }
-        // When APU is off, ignore all writes (CGB behavior)
-        // On DMG, length counters would still be writable, but cgb_sound tests expect CGB behavior
-        if (!self.enabled) return;
+        // When APU is off, only length counter registers are writable on DMG
+        if (!self.enabled) {
+            if (!self.cgb_mode) {
+                // DMG: length counters are writable when APU is off
+                switch (address) {
+                    0xFF11 => self.ch1.length_counter = 64 - @as(u16, value & 0x3F),
+                    0xFF16 => self.ch2.length_counter = 64 - @as(u16, value & 0x3F),
+                    0xFF1B => self.ch3_length_counter = 256 - @as(u16, value),
+                    0xFF20 => self.ch4_length_counter = @truncate(64 - @as(u8, value & 0x3F)),
+                    else => {},
+                }
+            }
+            return;
+        }
 
         switch (address) {
             0xFF10 => {
@@ -474,6 +507,26 @@ pub const Apu = struct {
     }
 
     fn trigger_ch3(self: *Apu) void {
+        // DMG wave RAM corruption: triggering CH3 while it reads a sample byte
+        // On real hardware this is a 1 T-cycle window; at M-cycle granularity
+        // we check if the wave timer aligns with the read cycle
+        if (!self.cgb_mode and self.ch3_enabled) {
+            if (self.ch3_timer == 2) {
+                // The wave channel increments position then reads, so use next position
+                const next_pos = (self.ch3_position + 1) & 31;
+                const pos_byte = next_pos >> 1;
+                if (pos_byte < 4) {
+                    self.wave_ram[0] = self.wave_ram[pos_byte];
+                } else {
+                    const aligned = pos_byte & 0xFC;
+                    self.wave_ram[0] = self.wave_ram[aligned];
+                    self.wave_ram[1] = self.wave_ram[aligned + 1];
+                    self.wave_ram[2] = self.wave_ram[aligned + 2];
+                    self.wave_ram[3] = self.wave_ram[aligned + 3];
+                }
+            }
+        }
+
         self.ch3_enabled = true;
         if (self.ch3_length_counter == 0) {
             self.ch3_length_counter = 256;
@@ -503,8 +556,13 @@ pub const Apu = struct {
     }
 
     fn power_off(self: *Apu) void {
+        // Save length counters — on DMG they survive power-off
+        const ch1_lc = self.ch1.length_counter;
+        const ch2_lc = self.ch2.length_counter;
+        const ch3_lc = self.ch3_length_counter;
+        const ch4_lc = self.ch4_length_counter;
+
         // Clear all registers and internal state
-        // Length counters are also cleared on CGB
         self.ch1 = .{};
         self.ch2 = .{};
         self.ch1_sweep_period = 0;
@@ -532,6 +590,14 @@ pub const Apu = struct {
         self.ch4_length_counter = 0;
         self.nr50 = 0;
         self.nr51 = 0;
+
+        // On DMG, length counters survive power-off
+        if (!self.cgb_mode) {
+            self.ch1.length_counter = ch1_lc;
+            self.ch2.length_counter = ch2_lc;
+            self.ch3_length_counter = ch3_lc;
+            self.ch4_length_counter = ch4_lc;
+        }
     }
 
     pub fn get_samples(self: *Apu) []const i16 {
