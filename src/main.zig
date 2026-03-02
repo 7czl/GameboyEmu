@@ -202,7 +202,7 @@ pub fn main() !void {
     if (headless) {
         run_headless(&cpu, &bus, max_cycles);
     } else {
-        try run_with_sdl(&cpu, &bus, &display, &joypad);
+        try run_with_sdl(&cpu, &bus, &display, &joypad, allocator, if (battery and sav_path_len > 0) sav_path_buf[0..sav_path_len] else null);
     }
 
     // Save battery-backed RAM on exit
@@ -299,7 +299,7 @@ fn check_memory_output(bus: *Bus) bool {
 }
 
 /// SDL mode: run with display window and input handling
-fn run_with_sdl(cpu: *Cpu, bus: *Bus, display: *Display, joypad: *Joypad) !void {
+fn run_with_sdl(cpu: *Cpu, bus: *Bus, display: *Display, joypad: *Joypad, allocator: std.mem.Allocator, sav_path: ?[]const u8) !void {
     // Initialize SDL (video + audio)
     if (c.SDL_Init(c.SDL_INIT_VIDEO | c.SDL_INIT_AUDIO) != 0) {
         std.log.err("SDL_Init failed: {s}", .{c.SDL_GetError()});
@@ -359,6 +359,8 @@ fn run_with_sdl(cpu: *Cpu, bus: *Bus, display: *Display, joypad: *Joypad) !void 
     const cycles_per_frame: u32 = 70224;
     var running = true;
     var excess_cycles: u32 = 0;
+    var frame_count: u32 = 0;
+    const save_interval: u32 = 60; // auto-save check every ~1 second
 
     while (running) {
         // Poll SDL events
@@ -433,6 +435,31 @@ fn run_with_sdl(cpu: *Cpu, bus: *Bus, display: *Display, joypad: *Joypad) !void 
             while (c.SDL_GetQueuedAudioSize(audio_dev) > 1478 * 2 * 2) {
                 c.SDL_Delay(1);
             }
+        }
+
+        // Auto-save: write .sav when RAM has been written to
+        frame_count += 1;
+        if (bus.ram_dirty and frame_count >= save_interval) {
+            frame_count = 0;
+            bus.ram_dirty = false;
+            if (sav_path) |path| {
+                if (bus.mbc.has_rtc()) {
+                    if (bus.mbc.get_save_data_with_rtc(allocator)) |save_data| {
+                        defer allocator.free(save_data);
+                        if (std.fs.cwd().createFile(path, .{})) |f| {
+                            defer f.close();
+                            f.writeAll(save_data) catch {};
+                        } else |_| {}
+                    }
+                } else if (bus.mbc.get_ram_data()) |ram_data| {
+                    if (std.fs.cwd().createFile(path, .{})) |f| {
+                        defer f.close();
+                        f.writeAll(ram_data) catch {};
+                    } else |_| {}
+                }
+            }
+        } else if (!bus.ram_dirty and frame_count >= save_interval) {
+            frame_count = 0; // reset counter even if not dirty
         }
     }
 }

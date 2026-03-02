@@ -42,6 +42,8 @@ pub const Bus = struct {
     hdma_dst: u16 = 0,
     hdma_length: u8 = 0xFF, // $FF55 — remaining length (0xFF = inactive)
     hdma_active: bool = false, // true = HBlank DMA in progress
+    // Battery-backed RAM dirty flag — set when external RAM is written
+    ram_dirty: bool = false,
 
     pub const Interrupt = enum(u8) {
         VBlank = 1 << 0,
@@ -208,7 +210,10 @@ pub const Bus = struct {
         switch (address) {
             0x0000...0x7FFF => self.mbc.write_rom(address, value),
             0x8000...0x9FFF => self.vram[self.vram_bank][address - 0x8000] = value,
-            0xA000...0xBFFF => self.mbc.write_ram(address, value),
+            0xA000...0xBFFF => {
+                self.mbc.write_ram(address, value);
+                self.ram_dirty = true;
+            },
             0xC000...0xCFFF => self.wram[0][address - 0xC000] = value,
             0xD000...0xDFFF => self.wram[self.wram_bank][address - 0xD000] = value,
             0xE000...0xEFFF => self.wram[0][address - 0xE000] = value,
