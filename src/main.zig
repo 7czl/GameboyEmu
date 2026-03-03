@@ -16,6 +16,22 @@ const c = @cImport({
 
 const SCALE: c_int = 3;
 
+// ROM loading context
+const RomContext = struct {
+    rom_bytes: []const u8,
+    rom_path: []const u8,
+    battery: bool,
+    sav_path: ?[]const u8,
+    state_base: ?[]const u8,
+    rom_title: []const u8,
+    cgb_mode: bool,
+
+    // Buffers owned by this context
+    sav_path_buf: [512]u8,
+    state_base_buf: [512]u8,
+    rom_title_buf: [16]u8,
+};
+
 pub fn main() !void {
     std.log.info("Starting GameBoy emulator..", .{});
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -25,7 +41,7 @@ pub fn main() !void {
     defer std.process.argsFree(allocator, args);
 
     // Parse arguments
-    var rom_path: []const u8 = "roms/tetris.gb";
+    var rom_path: ?[]const u8 = null;
     var boot_rom_path: []const u8 = "dmg_boot.bin";
     var headless = false;
     var max_cycles: u64 = 0; // 0 = unlimited
@@ -50,10 +66,19 @@ pub fn main() !void {
         }
     }
 
-    std.log.info("Loading ROM from: {s}", .{rom_path});
+    // If no ROM specified and not headless, show welcome screen
+    if (rom_path == null and !headless) {
+        try show_welcome_screen();
+        return;
+    }
+
+    // Use default ROM if none specified (for headless mode compatibility)
+    const actual_rom_path = rom_path orelse "roms/tetris.gb";
+
+    std.log.info("Loading ROM from: {s}", .{actual_rom_path});
     if (headless) std.log.info("Running in headless mode", .{});
 
-    var file = try std.fs.cwd().openFile(rom_path, .{ .mode = .read_only });
+    var file = try std.fs.cwd().openFile(actual_rom_path, .{ .mode = .read_only });
     defer file.close();
     const file_size = try file.getEndPos();
     const fd = file.handle;
@@ -97,7 +122,7 @@ pub fn main() !void {
     var sav_path_len: usize = 0;
     if (battery) {
         // Replace .gb/.gbc extension with .sav
-        const rom_name = rom_path;
+        const rom_name = actual_rom_path;
         var base_len = rom_name.len;
         const lower3 = if (base_len > 3) blk: {
             var buf: [3]u8 = undefined;
@@ -205,16 +230,16 @@ pub fn main() !void {
     var state_base_buf: [512]u8 = undefined;
     var state_base_len: usize = 0;
     {
-        var base_len = rom_path.len;
+        var base_len = actual_rom_path.len;
         // Strip extension
         const lower3 = if (base_len > 3) blk: {
             var buf3: [3]u8 = undefined;
-            for (rom_path[base_len - 3 ..][0..3], 0..) |ch, idx| buf3[idx] = std.ascii.toLower(ch);
+            for (actual_rom_path[base_len - 3 ..][0..3], 0..) |ch, idx| buf3[idx] = std.ascii.toLower(ch);
             break :blk buf3;
         } else [3]u8{ 0, 0, 0 };
         const lower4 = if (base_len > 4) blk: {
             var buf4: [4]u8 = undefined;
-            for (rom_path[base_len - 4 ..][0..4], 0..) |ch, idx| buf4[idx] = std.ascii.toLower(ch);
+            for (actual_rom_path[base_len - 4 ..][0..4], 0..) |ch, idx| buf4[idx] = std.ascii.toLower(ch);
             break :blk buf4;
         } else [4]u8{ 0, 0, 0, 0 };
         if (base_len > 3 and std.mem.eql(u8, &lower3, ".gb")) {
@@ -223,7 +248,7 @@ pub fn main() !void {
             base_len -= 4;
         }
         if (base_len <= state_base_buf.len) {
-            @memcpy(state_base_buf[0..base_len], rom_path[0..base_len]);
+            @memcpy(state_base_buf[0..base_len], actual_rom_path[0..base_len]);
             state_base_len = base_len;
         }
     }
@@ -662,6 +687,35 @@ fn run_with_sdl(cpu: *Cpu, bus: *Bus, display: *Display, joypad: *Joypad, alloca
                     display.show_osd("RESET", osd_duration);
                     if (audio_dev != 0) c.SDL_ClearQueuedAudio(audio_dev);
                 }
+            } else if (event.type == c.SDL_DROPFILE) {
+                // Handle drag-and-drop ROM file
+                const dropped_file = event.drop.file;
+                if (dropped_file != null) {
+                    const file_path = std.mem.span(dropped_file);
+                    std.log.info("ROM dropped: {s}", .{file_path});
+
+                    // Save current ROM's battery RAM if needed
+                    if (sav_path) |path| {
+                        if (bus.mbc.has_rtc()) {
+                            if (bus.mbc.get_save_data_with_rtc(allocator)) |save_data| {
+                                defer allocator.free(save_data);
+                                if (std.fs.cwd().createFile(path, .{})) |f| {
+                                    defer f.close();
+                                    f.writeAll(save_data) catch {};
+                                } else |_| {}
+                            }
+                        } else if (bus.mbc.get_ram_data()) |ram_data| {
+                            if (std.fs.cwd().createFile(path, .{})) |f| {
+                                defer f.close();
+                                f.writeAll(ram_data) catch {};
+                            } else |_| {}
+                        }
+                    }
+
+                    display.show_osd("ROM RELOAD", osd_duration);
+                    std.log.info("Please restart with: zig build run -- {s}", .{file_path});
+                    c.SDL_free(dropped_file);
+                }
             } else if (event.type == c.SDL_CONTROLLERDEVICEADDED) {
                 if (controller == null) {
                     controller = c.SDL_GameControllerOpen(event.cdevice.which);
@@ -854,4 +908,100 @@ fn controller_to_gb_key(btn: u8) ?Joypad.Key {
         c.SDL_CONTROLLER_BUTTON_DPAD_RIGHT => .right,
         else => null,
     };
+}
+
+/// Show welcome screen with instructions
+fn show_welcome_screen() !void {
+    if (c.SDL_Init(c.SDL_INIT_VIDEO) != 0) {
+        std.log.err("SDL_Init failed: {s}", .{c.SDL_GetError()});
+        return error.SDLInitFailed;
+    }
+    defer c.SDL_Quit();
+
+    const window = c.SDL_CreateWindow(
+        "gbemu - Welcome",
+        c.SDL_WINDOWPOS_CENTERED,
+        c.SDL_WINDOWPOS_CENTERED,
+        640,
+        480,
+        c.SDL_WINDOW_SHOWN,
+    ) orelse return error.SDLWindowFailed;
+    defer c.SDL_DestroyWindow(window);
+
+    const renderer = c.SDL_CreateRenderer(
+        window,
+        -1,
+        c.SDL_RENDERER_ACCELERATED,
+    ) orelse return error.SDLRendererFailed;
+    defer c.SDL_DestroyRenderer(renderer);
+
+    var display = Display.init();
+
+    // Draw welcome message on display
+    const welcome_lines = [_][]const u8{
+        "GBEMU",
+        "",
+        "DRAG ROM HERE",
+        "OR RUN:",
+        "ZIG BUILD RUN",
+        "-- ROM.GB",
+    };
+
+    var y: u32 = 40;
+    for (welcome_lines) |line| {
+        display.draw_text(line, 20, y);
+        y += 12;
+    }
+
+    display.show_osd("PRESS ESC TO EXIT", 0xFFFF);
+
+    const texture = c.SDL_CreateTexture(
+        renderer,
+        c.SDL_PIXELFORMAT_ARGB8888,
+        c.SDL_TEXTUREACCESS_STREAMING,
+        160,
+        144,
+    ) orelse return error.SDLTextureFailed;
+    defer c.SDL_DestroyTexture(texture);
+
+    var running = true;
+    while (running) {
+        var event: c.SDL_Event = undefined;
+        while (c.SDL_PollEvent(&event) != 0) {
+            if (event.type == c.SDL_QUIT) {
+                running = false;
+            } else if (event.type == c.SDL_KEYDOWN) {
+                if (event.key.keysym.sym == c.SDLK_ESCAPE) {
+                    running = false;
+                }
+            } else if (event.type == c.SDL_DROPFILE) {
+                const dropped_file = event.drop.file;
+                if (dropped_file != null) {
+                    const file_path = std.mem.span(dropped_file);
+                    std.log.info("ROM dropped: {s}", .{file_path});
+                    std.log.info("Restarting with ROM...", .{});
+
+                    // Print command to run
+                    std.debug.print("\nRun: zig build run -- \"{s}\"\n", .{file_path});
+
+                    c.SDL_free(dropped_file);
+                    running = false;
+                }
+            }
+        }
+
+        // Render
+        const front = display.front_buffer();
+        var osd_buf: [160 * 144]u32 = undefined;
+        @memcpy(&osd_buf, front);
+        display.render_osd(&osd_buf);
+
+        _ = c.SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
+        _ = c.SDL_RenderClear(renderer);
+        _ = c.SDL_UpdateTexture(texture, null, @ptrCast(&osd_buf), 160 * @sizeOf(u32));
+        _ = c.SDL_RenderCopy(renderer, texture, null, null);
+        c.SDL_RenderPresent(renderer);
+
+        c.SDL_Delay(16);
+    }
 }

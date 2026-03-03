@@ -99,6 +99,27 @@ pub const Display = struct {
 
         self.osd_frames -= 1;
     }
+
+    /// Draw text directly to back buffer (for welcome screen)
+    pub fn draw_text(self: *Display, text: []const u8, x: u32, y: u32) void {
+        const char_w: u32 = 4; // 3px char + 1px gap
+        for (text, 0..) |ch, ci| {
+            const glyph = font_glyph(ch);
+            const cx: u32 = x + @as(u32, @intCast(ci)) * char_w;
+            for (glyph, 0..) |row, ry| {
+                var bit: u3 = 2;
+                while (true) {
+                    if (row & (@as(u8, 1) << bit) != 0) {
+                        const px = cx + (2 - @as(u32, bit));
+                        const py = y + @as(u32, @intCast(ry));
+                        self.set_pixel(px, py, 0xFFFFFFFF);
+                    }
+                    if (bit == 0) break;
+                    bit -= 1;
+                }
+            }
+        }
+    }
 };
 
 // 3x5 pixel font for OSD — covers A-Z, 0-9, space, and common punctuation
