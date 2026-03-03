@@ -496,12 +496,21 @@ fn run_with_sdl(cpu: *Cpu, bus: *Bus, display: *Display, joypad: *Joypad, alloca
         // Push audio samples and throttle to ~59.7 fps via audio sync
         if (audio_dev != 0) {
             const samples = bus.apu.get_samples();
-            if (!fast_forward and samples.len > 0) {
-                _ = c.SDL_QueueAudio(
-                    audio_dev,
-                    @ptrCast(samples.ptr),
-                    @intCast(samples.len * @sizeOf(i16)),
-                );
+            if (samples.len > 0) {
+                if (fast_forward) {
+                    // Downsample: take every Nth sample for accelerated playback
+                    var ds_i: usize = 0;
+                    while (ds_i < samples.len) : (ds_i += ff_multiplier) {
+                        const s = [1]i16{samples[ds_i]};
+                        _ = c.SDL_QueueAudio(audio_dev, @ptrCast(&s), @sizeOf(i16));
+                    }
+                } else {
+                    _ = c.SDL_QueueAudio(
+                        audio_dev,
+                        @ptrCast(samples.ptr),
+                        @intCast(samples.len * @sizeOf(i16)),
+                    );
+                }
             }
             // Throttle: wait until audio buffer drains (skip during fast-forward)
             if (!fast_forward) {
