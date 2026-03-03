@@ -589,6 +589,78 @@ fn run_with_sdl(cpu: *Cpu, bus: *Bus, display: *Display, joypad: *Joypad, alloca
                             c.SDL_PauseAudioDevice(audio_dev, 0);
                         }
                     }
+                } else if (sym == c.SDLK_r and pressed) {
+                    // Soft reset: reinitialize CPU, PPU, Timer, APU, Joypad (keep MBC RAM)
+                    cpu.* = Cpu.init();
+                    bus.ppu.reset();
+                    bus.timer.* = Timer.init();
+                    bus.joypad.* = Joypad.init();
+                    bus.apu.* = Apu.init(bus.cgb_mode);
+                    bus.interrupt_enable_register = 0;
+                    bus.interrupt_flag = 0xE1;
+                    bus.boot_rom_active = false;
+                    for (&bus.wram) |*bank| {
+                        @memset(bank, 0);
+                    }
+                    @memset(&bus.hram, 0);
+                    @memset(&bus.io_registers, 0);
+                    // Set post-boot register values
+                    if (bus.cgb_mode) {
+                        cpu.a = 0x11;
+                        cpu.f = 0x80;
+                        cpu.b = 0x00;
+                        cpu.c = 0x00;
+                        cpu.d = 0xFF;
+                        cpu.e = 0x56;
+                        cpu.h = 0x00;
+                        cpu.l = 0x0D;
+                    } else {
+                        cpu.a = 0x01;
+                        cpu.f = 0xB0;
+                        cpu.b = 0x00;
+                        cpu.c = 0x13;
+                        cpu.d = 0x00;
+                        cpu.e = 0xD8;
+                        cpu.h = 0x01;
+                        cpu.l = 0x4D;
+                    }
+                    cpu.sp = 0xFFFE;
+                    cpu.pc = 0x0100;
+                    cpu.cycles = 0;
+                    // IO registers
+                    bus.timer.div_counter = 0xAB00;
+                    bus.timer.tac = 0xF8;
+                    bus.ppu.lcdc = 0x91;
+                    bus.ppu.stat = 0x85;
+                    bus.ppu.bgp = 0xFC;
+                    bus.ppu.obp0 = 0x00;
+                    bus.ppu.obp1 = 0x00;
+                    bus.ppu.enabled = true;
+                    // Audio registers
+                    bus.write(0xFF26, 0xF1);
+                    bus.write(0xFF10, 0x80);
+                    bus.write(0xFF11, 0xBF);
+                    bus.write(0xFF12, 0xF3);
+                    bus.write(0xFF13, 0xFF);
+                    bus.write(0xFF14, 0xBF);
+                    bus.write(0xFF16, 0x3F);
+                    bus.write(0xFF17, 0x00);
+                    bus.write(0xFF18, 0xFF);
+                    bus.write(0xFF19, 0xBF);
+                    bus.write(0xFF1A, 0x7F);
+                    bus.write(0xFF1B, 0xFF);
+                    bus.write(0xFF1C, 0x9F);
+                    bus.write(0xFF1D, 0xFF);
+                    bus.write(0xFF1E, 0xBF);
+                    bus.write(0xFF20, 0xFF);
+                    bus.write(0xFF21, 0x00);
+                    bus.write(0xFF22, 0x00);
+                    bus.write(0xFF23, 0xBF);
+                    bus.write(0xFF24, 0x77);
+                    bus.write(0xFF25, 0xF3);
+                    bus.io_registers[0x46] = 0xFF;
+                    display.show_osd("RESET", osd_duration);
+                    if (audio_dev != 0) c.SDL_ClearQueuedAudio(audio_dev);
                 }
             } else if (event.type == c.SDL_CONTROLLERDEVICEADDED) {
                 if (controller == null) {
