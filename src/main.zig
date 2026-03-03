@@ -16,20 +16,10 @@ const c = @cImport({
 
 const SCALE: c_int = 3;
 
-// ROM loading context
-const RomContext = struct {
-    rom_bytes: []const u8,
-    rom_path: []const u8,
-    battery: bool,
-    sav_path: ?[]const u8,
-    state_base: ?[]const u8,
-    rom_title: []const u8,
-    cgb_mode: bool,
-
-    // Buffers owned by this context
-    sav_path_buf: [512]u8,
-    state_base_buf: [512]u8,
-    rom_title_buf: [16]u8,
+// Result from SDL loop - either exit or load a new ROM
+const SdlResult = union(enum) {
+    exit: void,
+    load_rom: []const u8, // path to new ROM (allocated, caller must free)
 };
 
 pub fn main() !void {
@@ -267,7 +257,40 @@ pub fn main() !void {
     if (headless) {
         run_headless(&cpu, &bus, max_cycles);
     } else {
-        try run_with_sdl(&cpu, &bus, &display, &joypad, allocator, if (battery and sav_path_len > 0) sav_path_buf[0..sav_path_len] else null, if (state_base_len > 0) state_base_buf[0..state_base_len] else null, rom_title);
+        // Run SDL loop - if it returns a new ROM path, restart with new ROM
+        const result = try run_with_sdl(&cpu, &bus, &display, &joypad, allocator, if (battery and sav_path_len > 0) sav_path_buf[0..sav_path_len] else null, if (state_base_len > 0) state_base_buf[0..state_base_len] else null, rom_title);
+        if (result) |new_path| {
+            defer allocator.free(new_path);
+            // Save current ROM's battery RAM before switching
+            if (battery and sav_path_len > 0) {
+                const sav_path = sav_path_buf[0..sav_path_len];
+                if (bus.mbc.has_rtc()) {
+                    if (bus.mbc.get_save_data_with_rtc(allocator)) |save_data| {
+                        defer allocator.free(save_data);
+                        if (std.fs.cwd().createFile(sav_path, .{})) |f| {
+                            defer f.close();
+                            f.writeAll(save_data) catch {};
+                        } else |_| {}
+                    }
+                } else if (bus.mbc.get_ram_data()) |ram_data| {
+                    if (std.fs.cwd().createFile(sav_path, .{})) |f| {
+                        defer f.close();
+                        f.writeAll(ram_data) catch {};
+                    } else |_| {}
+                }
+            }
+            // Re-exec with new ROM path
+            std.log.info("Reloading with new ROM: {s}", .{new_path});
+            const exe_path = try allocator.dupeZ(u8, args[0]);
+            defer allocator.free(exe_path);
+            const new_rom_z = try allocator.dupeZ(u8, new_path);
+            defer allocator.free(new_rom_z);
+            const argv = [_:null]?[*:0]const u8{ exe_path, new_rom_z, null };
+            const err = std.posix.execveZ(exe_path, &argv, std.c.environ);
+            // If execve returns, it failed
+            std.log.err("Failed to reload ROM: {}", .{err});
+            return;
+        }
     }
 
     // Save battery-backed RAM on exit
@@ -364,7 +387,8 @@ fn check_memory_output(bus: *Bus) bool {
 }
 
 /// SDL mode: run with display window and input handling
-fn run_with_sdl(cpu: *Cpu, bus: *Bus, display: *Display, joypad: *Joypad, allocator: std.mem.Allocator, sav_path: ?[]const u8, state_base: ?[]const u8, rom_title: []const u8) !void {
+/// Returns null for normal exit, or path to new ROM for hot-reload
+fn run_with_sdl(cpu: *Cpu, bus: *Bus, display: *Display, joypad: *Joypad, allocator: std.mem.Allocator, sav_path: ?[]const u8, state_base: ?[]const u8, rom_title: []const u8) !?[]u8 {
     // Initialize SDL (video + audio + game controller)
     if (c.SDL_Init(c.SDL_INIT_VIDEO | c.SDL_INIT_AUDIO | c.SDL_INIT_GAMECONTROLLER) != 0) {
         std.log.err("SDL_Init failed: {s}", .{c.SDL_GetError()});
@@ -712,9 +736,13 @@ fn run_with_sdl(cpu: *Cpu, bus: *Bus, display: *Display, joypad: *Joypad, alloca
                         }
                     }
 
-                    display.show_osd("ROM RELOAD", osd_duration);
-                    std.log.info("Please restart with: zig build run -- {s}", .{file_path});
+                    // Duplicate path and return it for hot-reload
+                    const new_path = allocator.dupe(u8, file_path) catch {
+                        c.SDL_free(dropped_file);
+                        continue;
+                    };
                     c.SDL_free(dropped_file);
+                    return new_path;
                 }
             } else if (event.type == c.SDL_CONTROLLERDEVICEADDED) {
                 if (controller == null) {
@@ -878,6 +906,7 @@ fn run_with_sdl(cpu: *Cpu, bus: *Bus, display: *Display, joypad: *Joypad, alloca
             fps_timer = now_ns;
         }
     }
+    return null; // Normal exit
 }
 
 fn sdl_to_gb_key(sym: i32) ?Joypad.Key {
