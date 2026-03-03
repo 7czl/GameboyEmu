@@ -16,12 +16,6 @@ const c = @cImport({
 
 const SCALE: c_int = 3;
 
-// Result from SDL loop - either exit or load a new ROM
-const SdlResult = union(enum) {
-    exit: void,
-    load_rom: []const u8, // path to new ROM (allocated, caller must free)
-};
-
 pub fn main() !void {
     std.log.info("Starting GameBoy emulator..", .{});
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -56,15 +50,55 @@ pub fn main() !void {
         }
     }
 
-    // If no ROM specified and not headless, show welcome screen
+    // If no ROM specified and not headless, show welcome screen and wait for drop
     if (rom_path == null and !headless) {
-        try show_welcome_screen();
-        return;
+        const dropped = try show_welcome_screen(allocator);
+        if (dropped) |path| {
+            rom_path = path;
+            // Will be freed at end of main loop
+        } else {
+            return; // User closed welcome screen without dropping ROM
+        }
+    }
+
+    // Track if we own the ROM path (need to free it)
+    var rom_path_owned = false;
+
+    // If ROM came from welcome screen drop, we own it
+    if (rom_path != null) {
+        // Check if rom_path points to args memory or allocated memory
+        var is_from_args = false;
+        for (args) |arg| {
+            if (rom_path.?.ptr == arg.ptr) {
+                is_from_args = true;
+                break;
+            }
+        }
+        rom_path_owned = !is_from_args;
     }
 
     // Use default ROM if none specified (for headless mode compatibility)
-    const actual_rom_path = rom_path orelse "roms/tetris.gb";
+    var current_rom_path = rom_path orelse "roms/tetris.gb";
 
+    // Main emulator loop with hot-reload support
+    while (true) {
+        const result = try run_single_rom(allocator, current_rom_path, boot_rom_path, headless, max_cycles, force_dmg);
+        if (result) |new_path| {
+            // Hot-reload: free old path if owned, switch to new
+            if (rom_path_owned) allocator.free(current_rom_path);
+            current_rom_path = new_path;
+            rom_path_owned = true;
+            std.log.info("Hot-reloading ROM: {s}", .{new_path});
+        } else {
+            // Normal exit
+            if (rom_path_owned) allocator.free(current_rom_path);
+            break;
+        }
+    }
+}
+
+/// Run emulator for a single ROM. Returns new ROM path for hot-reload, or null for exit.
+fn run_single_rom(allocator: std.mem.Allocator, actual_rom_path: []const u8, boot_rom_path: []const u8, headless: bool, max_cycles: u64, force_dmg: bool) !?[]u8 {
     std.log.info("Loading ROM from: {s}", .{actual_rom_path});
     if (headless) std.log.info("Running in headless mode", .{});
 
@@ -260,7 +294,6 @@ pub fn main() !void {
         // Run SDL loop - if it returns a new ROM path, restart with new ROM
         const result = try run_with_sdl(&cpu, &bus, &display, &joypad, allocator, if (battery and sav_path_len > 0) sav_path_buf[0..sav_path_len] else null, if (state_base_len > 0) state_base_buf[0..state_base_len] else null, rom_title);
         if (result) |new_path| {
-            defer allocator.free(new_path);
             // Save current ROM's battery RAM before switching
             if (battery and sav_path_len > 0) {
                 const sav_path = sav_path_buf[0..sav_path_len];
@@ -279,17 +312,8 @@ pub fn main() !void {
                     } else |_| {}
                 }
             }
-            // Re-exec with new ROM path
-            std.log.info("Reloading with new ROM: {s}", .{new_path});
-            const exe_path = try allocator.dupeZ(u8, args[0]);
-            defer allocator.free(exe_path);
-            const new_rom_z = try allocator.dupeZ(u8, new_path);
-            defer allocator.free(new_rom_z);
-            const argv = [_:null]?[*:0]const u8{ exe_path, new_rom_z, null };
-            const err = std.posix.execveZ(exe_path, &argv, std.c.environ);
-            // If execve returns, it failed
-            std.log.err("Failed to reload ROM: {}", .{err});
-            return;
+            // Return new path for hot-reload (caller will handle)
+            return new_path;
         }
     }
 
@@ -322,6 +346,7 @@ pub fn main() !void {
             }
         }
     }
+    return null; // Normal exit
 }
 
 /// Headless mode: run without SDL, output serial to stdout, exit after max_cycles
@@ -939,8 +964,8 @@ fn controller_to_gb_key(btn: u8) ?Joypad.Key {
     };
 }
 
-/// Show welcome screen with instructions
-fn show_welcome_screen() !void {
+/// Show welcome screen with instructions. Returns ROM path if dropped, null if closed.
+fn show_welcome_screen(allocator: std.mem.Allocator) !?[]u8 {
     if (c.SDL_Init(c.SDL_INIT_VIDEO) != 0) {
         std.log.err("SDL_Init failed: {s}", .{c.SDL_GetError()});
         return error.SDLInitFailed;
@@ -1008,13 +1033,14 @@ fn show_welcome_screen() !void {
                 if (dropped_file != null) {
                     const file_path = std.mem.span(dropped_file);
                     std.log.info("ROM dropped: {s}", .{file_path});
-                    std.log.info("Restarting with ROM...", .{});
 
-                    // Print command to run
-                    std.debug.print("\nRun: zig build run -- \"{s}\"\n", .{file_path});
-
+                    // Duplicate path BEFORE freeing SDL memory
+                    const path_copy = allocator.dupe(u8, file_path) catch {
+                        c.SDL_free(dropped_file);
+                        continue;
+                    };
                     c.SDL_free(dropped_file);
-                    running = false;
+                    return path_copy;
                 }
             }
         }
@@ -1033,4 +1059,5 @@ fn show_welcome_screen() !void {
 
         c.SDL_Delay(16);
     }
+    return null; // User closed without dropping ROM
 }
