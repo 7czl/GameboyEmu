@@ -200,9 +200,9 @@ pub fn main() !void {
         bus.io_registers[0x46] = 0xFF; // DMA
     }
 
-    // Compute save state file path (.ss0)
-    var state_path_buf: [512]u8 = undefined;
-    var state_path_len: usize = 0;
+    // Compute save state base path (without slot extension)
+    var state_base_buf: [512]u8 = undefined;
+    var state_base_len: usize = 0;
     {
         var base_len = rom_path.len;
         // Strip extension
@@ -221,18 +221,16 @@ pub fn main() !void {
         } else if (base_len > 4 and std.mem.eql(u8, &lower4, ".gbc")) {
             base_len -= 4;
         }
-        const ext = ".ss0";
-        if (base_len + ext.len <= state_path_buf.len) {
-            @memcpy(state_path_buf[0..base_len], rom_path[0..base_len]);
-            @memcpy(state_path_buf[base_len .. base_len + ext.len], ext);
-            state_path_len = base_len + ext.len;
+        if (base_len <= state_base_buf.len) {
+            @memcpy(state_base_buf[0..base_len], rom_path[0..base_len]);
+            state_base_len = base_len;
         }
     }
 
     if (headless) {
         run_headless(&cpu, &bus, max_cycles);
     } else {
-        try run_with_sdl(&cpu, &bus, &display, &joypad, allocator, if (battery and sav_path_len > 0) sav_path_buf[0..sav_path_len] else null, if (state_path_len > 0) state_path_buf[0..state_path_len] else null);
+        try run_with_sdl(&cpu, &bus, &display, &joypad, allocator, if (battery and sav_path_len > 0) sav_path_buf[0..sav_path_len] else null, if (state_base_len > 0) state_base_buf[0..state_base_len] else null);
     }
 
     // Save battery-backed RAM on exit
@@ -329,7 +327,7 @@ fn check_memory_output(bus: *Bus) bool {
 }
 
 /// SDL mode: run with display window and input handling
-fn run_with_sdl(cpu: *Cpu, bus: *Bus, display: *Display, joypad: *Joypad, allocator: std.mem.Allocator, sav_path: ?[]const u8, state_path: ?[]const u8) !void {
+fn run_with_sdl(cpu: *Cpu, bus: *Bus, display: *Display, joypad: *Joypad, allocator: std.mem.Allocator, sav_path: ?[]const u8, state_base: ?[]const u8) !void {
     // Initialize SDL (video + audio + game controller)
     if (c.SDL_Init(c.SDL_INIT_VIDEO | c.SDL_INIT_AUDIO | c.SDL_INIT_GAMECONTROLLER) != 0) {
         std.log.err("SDL_Init failed: {s}", .{c.SDL_GetError()});
@@ -412,6 +410,22 @@ fn run_with_sdl(cpu: *Cpu, bus: *Bus, display: *Display, joypad: *Joypad, alloca
     var paused = false;
     const osd_duration: u16 = 120; // ~2 seconds at 60fps
     var osd_buf: [160 * 144]u32 = undefined;
+    var state_slot: u8 = 0; // save state slot 0-3
+    var volume: u8 = 100; // volume 0-100, step 10
+
+    // Helper to build state path for current slot
+    var slot_path_buf: [520]u8 = undefined;
+    const build_slot_path = struct {
+        fn call(base: ?[]const u8, slot: u8, buf: []u8) ?[]const u8 {
+            const b = base orelse return null;
+            const exts = [4][]const u8{ ".ss0", ".ss1", ".ss2", ".ss3" };
+            const ext = exts[slot];
+            if (b.len + ext.len > buf.len) return null;
+            @memcpy(buf[0..b.len], b);
+            @memcpy(buf[b.len .. b.len + ext.len], ext);
+            return buf[0 .. b.len + ext.len];
+        }
+    }.call;
 
     while (running) {
         // Poll SDL events
@@ -425,7 +439,7 @@ fn run_with_sdl(cpu: *Cpu, bus: *Bus, display: *Display, joypad: *Joypad, alloca
                 if (pressed) {
                     // F5: save state
                     if (sym == c.SDLK_F5) {
-                        if (state_path) |sp| {
+                        if (build_slot_path(state_base, state_slot, &slot_path_buf)) |sp| {
                             if (savestate.save(allocator, cpu, bus)) |data| {
                                 defer allocator.free(data);
                                 if (std.fs.cwd().createFile(sp, .{})) |f| {
@@ -439,7 +453,7 @@ fn run_with_sdl(cpu: *Cpu, bus: *Bus, display: *Display, joypad: *Joypad, alloca
                     }
                     // F8: load state
                     if (sym == c.SDLK_F8) {
-                        if (state_path) |sp| {
+                        if (build_slot_path(state_base, state_slot, &slot_path_buf)) |sp| {
                             if (std.fs.cwd().openFile(sp, .{ .mode = .read_only })) |f| {
                                 defer f.close();
                                 if (f.readToEndAlloc(allocator, 4 * 1024 * 1024)) |data| {
@@ -465,7 +479,60 @@ fn run_with_sdl(cpu: *Cpu, bus: *Bus, display: *Display, joypad: *Joypad, alloca
                             _ = c.SDL_SetWindowFullscreen(window, c.SDL_WINDOW_FULLSCREEN_DESKTOP);
                         }
                     }
-                    // 1-5: integer scale
+                    // F1-F4: select save state slot
+                    if (sym >= c.SDLK_F1 and sym <= c.SDLK_F4) {
+                        state_slot = @intCast(sym - c.SDLK_F1);
+                        const slot_names = [4][]const u8{ "SLOT 1", "SLOT 2", "SLOT 3", "SLOT 4" };
+                        display.show_osd(slot_names[state_slot], osd_duration);
+                    }
+                    // +/=: volume up, -: volume down
+                    if (sym == c.SDLK_EQUALS or sym == c.SDLK_PLUS) {
+                        if (volume <= 90) volume += 10 else volume = 100;
+                        var vol_msg: [7]u8 = "VOL    ".*;
+                        const d1 = volume / 100;
+                        const d2 = (volume / 10) % 10;
+                        const d3 = volume % 10;
+                        if (d1 > 0) {
+                            vol_msg[4] = '0' + d1;
+                            vol_msg[5] = '0' + d2;
+                            vol_msg[6] = '0' + d3;
+                            display.show_osd(vol_msg[0..7], osd_duration);
+                        } else if (d2 > 0) {
+                            vol_msg[4] = '0' + d2;
+                            vol_msg[5] = '0' + d3;
+                            vol_msg[6] = ' ';
+                            display.show_osd(vol_msg[0..6], osd_duration);
+                        } else {
+                            vol_msg[4] = '0' + d3;
+                            vol_msg[5] = ' ';
+                            vol_msg[6] = ' ';
+                            display.show_osd(vol_msg[0..5], osd_duration);
+                        }
+                    }
+                    if (sym == c.SDLK_MINUS) {
+                        if (volume >= 10) volume -= 10 else volume = 0;
+                        var vol_msg: [7]u8 = "VOL    ".*;
+                        const d1 = volume / 100;
+                        const d2 = (volume / 10) % 10;
+                        const d3 = volume % 10;
+                        if (d1 > 0) {
+                            vol_msg[4] = '0' + d1;
+                            vol_msg[5] = '0' + d2;
+                            vol_msg[6] = '0' + d3;
+                            display.show_osd(vol_msg[0..7], osd_duration);
+                        } else if (d2 > 0) {
+                            vol_msg[4] = '0' + d2;
+                            vol_msg[5] = '0' + d3;
+                            vol_msg[6] = ' ';
+                            display.show_osd(vol_msg[0..6], osd_duration);
+                        } else {
+                            vol_msg[4] = '0' + d3;
+                            vol_msg[5] = ' ';
+                            vol_msg[6] = ' ';
+                            display.show_osd(vol_msg[0..5], osd_duration);
+                        }
+                    }
+                    // 6-9: integer scale (1-5 conflicts with slot selection idea, keep as-is)
                     if (sym >= c.SDLK_1 and sym <= c.SDLK_5) {
                         const scale: c_int = sym - c.SDLK_1 + 1;
                         _ = c.SDL_SetWindowFullscreen(window, 0);
@@ -580,19 +647,31 @@ fn run_with_sdl(cpu: *Cpu, bus: *Bus, display: *Display, joypad: *Joypad, alloca
         if (audio_dev != 0 and !paused) {
             const samples = bus.apu.get_samples();
             if (samples.len > 0) {
-                if (fast_forward) {
-                    // Downsample: take every Nth sample for accelerated playback
-                    var ds_i: usize = 0;
-                    while (ds_i < samples.len) : (ds_i += ff_multiplier) {
-                        const s = [1]i16{samples[ds_i]};
-                        _ = c.SDL_QueueAudio(audio_dev, @ptrCast(&s), @sizeOf(i16));
+                if (volume == 100) {
+                    // Full volume — push directly
+                    if (fast_forward) {
+                        var ds_i: usize = 0;
+                        while (ds_i < samples.len) : (ds_i += ff_multiplier) {
+                            const s = [1]i16{samples[ds_i]};
+                            _ = c.SDL_QueueAudio(audio_dev, @ptrCast(&s), @sizeOf(i16));
+                        }
+                    } else {
+                        _ = c.SDL_QueueAudio(
+                            audio_dev,
+                            @ptrCast(samples.ptr),
+                            @intCast(samples.len * @sizeOf(i16)),
+                        );
                     }
                 } else {
-                    _ = c.SDL_QueueAudio(
-                        audio_dev,
-                        @ptrCast(samples.ptr),
-                        @intCast(samples.len * @sizeOf(i16)),
-                    );
+                    // Apply volume scaling
+                    const vol: i32 = @intCast(volume);
+                    const step: usize = if (fast_forward) ff_multiplier else 1;
+                    var si: usize = 0;
+                    while (si < samples.len) : (si += step) {
+                        const scaled: i16 = @intCast(@divTrunc(@as(i32, samples[si]) * vol, 100));
+                        const s = [1]i16{scaled};
+                        _ = c.SDL_QueueAudio(audio_dev, @ptrCast(&s), @sizeOf(i16));
+                    }
                 }
             }
             // Throttle: wait until audio buffer drains (skip during fast-forward)
