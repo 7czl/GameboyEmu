@@ -409,6 +409,9 @@ fn run_with_sdl(cpu: *Cpu, bus: *Bus, display: *Display, joypad: *Joypad, alloca
     const save_interval: u32 = 60; // auto-save check every ~1 second
     var fast_forward = false;
     const ff_multiplier: u32 = 4; // run 4x frames when fast-forwarding
+    var paused = false;
+    const osd_duration: u16 = 120; // ~2 seconds at 60fps
+    var osd_buf: [160 * 144]u32 = undefined;
 
     while (running) {
         // Poll SDL events
@@ -429,6 +432,7 @@ fn run_with_sdl(cpu: *Cpu, bus: *Bus, display: *Display, joypad: *Joypad, alloca
                                     defer f.close();
                                     f.writeAll(data) catch {};
                                     std.log.info("State saved to: {s}", .{sp});
+                                    display.show_osd("STATE SAVED", osd_duration);
                                 } else |_| {}
                             }
                         }
@@ -442,6 +446,7 @@ fn run_with_sdl(cpu: *Cpu, bus: *Bus, display: *Display, joypad: *Joypad, alloca
                                     defer allocator.free(data);
                                     if (savestate.load(data, cpu, bus)) {
                                         std.log.info("State loaded from: {s}", .{sp});
+                                        display.show_osd("STATE LOADED", osd_duration);
                                     } else {
                                         std.log.err("Invalid save state: {s}", .{sp});
                                     }
@@ -474,10 +479,24 @@ fn run_with_sdl(cpu: *Cpu, bus: *Bus, display: *Display, joypad: *Joypad, alloca
                 } else if (sym == c.SDLK_ESCAPE) {
                     running = false;
                 } else if (sym == c.SDLK_SPACE) {
-                    fast_forward = pressed;
-                    if (pressed and audio_dev != 0) {
-                        // Clear audio queue to avoid lag when entering fast-forward
-                        c.SDL_ClearQueuedAudio(audio_dev);
+                    if (!paused) {
+                        fast_forward = pressed;
+                        if (pressed and audio_dev != 0) {
+                            // Clear audio queue to avoid lag when entering fast-forward
+                            c.SDL_ClearQueuedAudio(audio_dev);
+                        }
+                    }
+                } else if (sym == c.SDLK_p and pressed) {
+                    paused = !paused;
+                    if (paused) {
+                        display.show_osd("PAUSED", 0xFFFF); // show until unpaused
+                        if (audio_dev != 0) c.SDL_PauseAudioDevice(audio_dev, 1);
+                    } else {
+                        display.osd_frames = 0; // clear PAUSED message
+                        if (audio_dev != 0) {
+                            c.SDL_ClearQueuedAudio(audio_dev);
+                            c.SDL_PauseAudioDevice(audio_dev, 0);
+                        }
                     }
                 }
             } else if (event.type == c.SDL_CONTROLLERDEVICEADDED) {
@@ -512,34 +531,53 @@ fn run_with_sdl(cpu: *Cpu, bus: *Bus, display: *Display, joypad: *Joypad, alloca
             }
         }
 
-        // Run one frame (or multiple when fast-forwarding)
-        const frames_to_run: u32 = if (fast_forward) ff_multiplier else 1;
-        var ff_i: u32 = 0;
-        while (ff_i < frames_to_run) : (ff_i += 1) {
-            var frame_cycles: u32 = excess_cycles;
-            while (frame_cycles < cycles_per_frame) {
-                const step_cycles = cpu.step(bus);
-                frame_cycles += step_cycles;
+        // Run one frame (or multiple when fast-forwarding) — skip when paused
+        if (!paused) {
+            const frames_to_run: u32 = if (fast_forward) ff_multiplier else 1;
+            var ff_i: u32 = 0;
+            while (ff_i < frames_to_run) : (ff_i += 1) {
+                var frame_cycles: u32 = excess_cycles;
+                while (frame_cycles < cycles_per_frame) {
+                    const step_cycles = cpu.step(bus);
+                    frame_cycles += step_cycles;
+                }
+                excess_cycles = frame_cycles - cycles_per_frame;
             }
-            excess_cycles = frame_cycles - cycles_per_frame;
         }
 
-        // Present frame if ready
-        if (display.frame_ready) {
+        // Present frame if ready (or re-render with OSD when paused)
+        if (display.frame_ready or (paused and display.osd_frames > 0)) {
+            const front = display.front_buffer();
+            @memcpy(&osd_buf, front);
+            display.render_osd(&osd_buf);
             _ = c.SDL_UpdateTexture(
                 texture,
                 null,
-                @ptrCast(display.front_buffer()),
+                @ptrCast(&osd_buf),
                 160 * @sizeOf(u32),
             );
             _ = c.SDL_RenderClear(renderer);
             _ = c.SDL_RenderCopy(renderer, texture, null, null);
             c.SDL_RenderPresent(renderer);
             display.frame_ready = false;
+        } else if (display.osd_frames > 0) {
+            // OSD active but no new frame — overlay on last frame
+            const front = display.front_buffer();
+            @memcpy(&osd_buf, front);
+            display.render_osd(&osd_buf);
+            _ = c.SDL_UpdateTexture(
+                texture,
+                null,
+                @ptrCast(&osd_buf),
+                160 * @sizeOf(u32),
+            );
+            _ = c.SDL_RenderClear(renderer);
+            _ = c.SDL_RenderCopy(renderer, texture, null, null);
+            c.SDL_RenderPresent(renderer);
         }
 
         // Push audio samples and throttle to ~59.7 fps via audio sync
-        if (audio_dev != 0) {
+        if (audio_dev != 0 and !paused) {
             const samples = bus.apu.get_samples();
             if (samples.len > 0) {
                 if (fast_forward) {
@@ -563,6 +601,11 @@ fn run_with_sdl(cpu: *Cpu, bus: *Bus, display: *Display, joypad: *Joypad, alloca
                     c.SDL_Delay(1);
                 }
             }
+        }
+
+        // When paused, sleep to avoid busy-looping
+        if (paused) {
+            c.SDL_Delay(16); // ~60fps polling rate
         }
 
         // Auto-save: write .sav when RAM has been written to
