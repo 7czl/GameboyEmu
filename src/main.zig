@@ -330,12 +330,28 @@ fn check_memory_output(bus: *Bus) bool {
 
 /// SDL mode: run with display window and input handling
 fn run_with_sdl(cpu: *Cpu, bus: *Bus, display: *Display, joypad: *Joypad, allocator: std.mem.Allocator, sav_path: ?[]const u8, state_path: ?[]const u8) !void {
-    // Initialize SDL (video + audio)
-    if (c.SDL_Init(c.SDL_INIT_VIDEO | c.SDL_INIT_AUDIO) != 0) {
+    // Initialize SDL (video + audio + game controller)
+    if (c.SDL_Init(c.SDL_INIT_VIDEO | c.SDL_INIT_AUDIO | c.SDL_INIT_GAMECONTROLLER) != 0) {
         std.log.err("SDL_Init failed: {s}", .{c.SDL_GetError()});
         return error.SDLInitFailed;
     }
     defer c.SDL_Quit();
+
+    // Open first available game controller
+    var controller: ?*c.SDL_GameController = null;
+    {
+        var i: c_int = 0;
+        while (i < c.SDL_NumJoysticks()) : (i += 1) {
+            if (c.SDL_IsGameController(i) != 0) {
+                controller = c.SDL_GameControllerOpen(i);
+                if (controller != null) {
+                    std.log.info("Controller connected: {s}", .{c.SDL_GameControllerName(controller)});
+                    break;
+                }
+            }
+        }
+    }
+    defer if (controller != null) c.SDL_GameControllerClose(controller);
 
     // Open audio device
     var want: c.SDL_AudioSpec = std.mem.zeroes(c.SDL_AudioSpec);
@@ -464,6 +480,35 @@ fn run_with_sdl(cpu: *Cpu, bus: *Bus, display: *Display, joypad: *Joypad, alloca
                         c.SDL_ClearQueuedAudio(audio_dev);
                     }
                 }
+            } else if (event.type == c.SDL_CONTROLLERDEVICEADDED) {
+                if (controller == null) {
+                    controller = c.SDL_GameControllerOpen(event.cdevice.which);
+                    if (controller != null) {
+                        std.log.info("Controller connected: {s}", .{c.SDL_GameControllerName(controller)});
+                    }
+                }
+            } else if (event.type == c.SDL_CONTROLLERDEVICEREMOVED) {
+                if (controller != null) {
+                    const joy = c.SDL_GameControllerGetJoystick(controller);
+                    if (joy != null and c.SDL_JoystickInstanceID(joy) == event.cdevice.which) {
+                        std.log.info("Controller disconnected", .{});
+                        c.SDL_GameControllerClose(controller);
+                        controller = null;
+                    }
+                }
+            } else if (event.type == c.SDL_CONTROLLERBUTTONDOWN or event.type == c.SDL_CONTROLLERBUTTONUP) {
+                const btn_pressed = event.type == c.SDL_CONTROLLERBUTTONDOWN;
+                const btn = event.cbutton.button;
+                const gb_key = controller_to_gb_key(btn);
+                if (gb_key) |k| {
+                    joypad.set_key(k, btn_pressed);
+                } else if (btn == c.SDL_CONTROLLER_BUTTON_RIGHTSHOULDER) {
+                    // R shoulder = fast forward
+                    fast_forward = btn_pressed;
+                    if (btn_pressed and audio_dev != 0) {
+                        c.SDL_ClearQueuedAudio(audio_dev);
+                    }
+                }
             }
         }
 
@@ -557,6 +602,22 @@ fn sdl_to_gb_key(sym: i32) ?Joypad.Key {
         c.SDLK_k => .b,
         c.SDLK_BACKSPACE => .select,
         c.SDLK_RETURN => .start,
+        else => null,
+    };
+}
+
+fn controller_to_gb_key(btn: u8) ?Joypad.Key {
+    return switch (btn) {
+        c.SDL_CONTROLLER_BUTTON_A => .a,
+        c.SDL_CONTROLLER_BUTTON_B => .b,
+        c.SDL_CONTROLLER_BUTTON_X => .a, // alternate A
+        c.SDL_CONTROLLER_BUTTON_Y => .b, // alternate B
+        c.SDL_CONTROLLER_BUTTON_BACK => .select,
+        c.SDL_CONTROLLER_BUTTON_START => .start,
+        c.SDL_CONTROLLER_BUTTON_DPAD_UP => .up,
+        c.SDL_CONTROLLER_BUTTON_DPAD_DOWN => .down,
+        c.SDL_CONTROLLER_BUTTON_DPAD_LEFT => .left,
+        c.SDL_CONTROLLER_BUTTON_DPAD_RIGHT => .right,
         else => null,
     };
 }
