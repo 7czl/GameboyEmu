@@ -10,11 +10,19 @@ pub const PpuMode = enum(u8) {
     Drawing = 3,
 };
 const DMG_COLORS = [4]u32{
-    0xFF_E0_F8_D0,
+    0xFF_E0_F8_D0, // lightest
     0xFF_88_C0_70,
     0xFF_34_68_56,
-    0xFF_08_18_20,
+    0xFF_08_18_20, // darkest
 };
+
+// DMG palette presets
+pub const DMG_PALETTE_GREEN = DMG_COLORS;
+pub const DMG_PALETTE_GRAYSCALE = [4]u32{ 0xFF_FF_FF_FF, 0xFF_AA_AA_AA, 0xFF_55_55_55, 0xFF_00_00_00 };
+pub const DMG_PALETTE_BROWN = [4]u32{ 0xFF_F8_E8_C8, 0xFF_D8_98_48, 0xFF_A8_50_20, 0xFF_30_18_08 };
+pub const DMG_PALETTE_POCKET = [4]u32{ 0xFF_C4_CF_A1, 0xFF_8B_95_6D, 0xFF_4D_53_3C, 0xFF_1F_1F_1F };
+pub const DMG_PALETTE_NAMES = [4][]const u8{ "GREEN", "GRAYSCALE", "BROWN", "POCKET" };
+pub const DMG_PALETTES = [4][4]u32{ DMG_PALETTE_GREEN, DMG_PALETTE_GRAYSCALE, DMG_PALETTE_BROWN, DMG_PALETTE_POCKET };
 const FifoPixel = struct {
     color: u2 = 0,
     palette: u3 = 0,
@@ -126,6 +134,7 @@ pub const Ppu = struct {
     sprite_fetch_ticks: u8 = 0,
     sprite_tile_lo: u8 = 0,
     sprite_tile_hi: u8 = 0,
+    dmg_colors: [4]u32 = DMG_COLORS,
     pub fn init() Ppu {
         return Ppu{};
     }
@@ -162,9 +171,9 @@ pub const Ppu = struct {
         }
         self.update_stat_irq(bus);
     }
-    fn palette_color(palette: u8, color_id: u2) u32 {
+    fn palette_color(self: *const Ppu, palette: u8, color_id: u2) u32 {
         const shade: u2 = @truncate((palette >> (@as(u3, color_id) * 2)) & 0x03);
-        return DMG_COLORS[shade];
+        return self.dmg_colors[shade];
     }
     fn rgb555_to_argb(color_lo: u8, color_hi: u8) u32 {
         const raw = @as(u16, color_lo) | (@as(u16, color_hi) << 8);
@@ -439,13 +448,13 @@ pub const Ppu = struct {
             }
         } else {
             if (pixel.is_sprite) {
-                const color = palette_color(pixel.sprite_dmg_palette, pixel.color);
+                const color = self.palette_color(pixel.sprite_dmg_palette, pixel.color);
                 disp.set_pixel(x, y, color);
             } else {
                 if (self.lcdc & 0x01 == 0) {
-                    disp.set_pixel(x, y, DMG_COLORS[0]);
+                    disp.set_pixel(x, y, self.dmg_colors[0]);
                 } else {
-                    const color = palette_color(self.bgp, pixel.color);
+                    const color = self.palette_color(self.bgp, pixel.color);
                     disp.set_pixel(x, y, color);
                 }
             }

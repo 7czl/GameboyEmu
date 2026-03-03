@@ -3,6 +3,7 @@ const Bus = @import("bus.zig").Bus;
 const Cpu = @import("cpu.zig").CPU;
 const Timer = @import("timer.zig").Timer;
 const Ppu = @import("ppu.zig").Ppu;
+const ppu_mod = @import("ppu.zig");
 const Display = @import("display.zig").Display;
 const Joypad = @import("joypad.zig").Joypad;
 const Apu = @import("apu.zig").Apu;
@@ -227,10 +228,21 @@ pub fn main() !void {
         }
     }
 
+    // Extract ROM title for window
+    var rom_title_buf: [16]u8 = undefined;
+    var rom_title_len: usize = 0;
+    if (rom_bytes.len > 0x143) {
+        var end: usize = 0x134;
+        while (end < 0x144 and rom_bytes[end] != 0) : (end += 1) {}
+        rom_title_len = end - 0x134;
+        @memcpy(rom_title_buf[0..rom_title_len], rom_bytes[0x134..end]);
+    }
+    const rom_title: []const u8 = if (rom_title_len > 0) rom_title_buf[0..rom_title_len] else "gbemu";
+
     if (headless) {
         run_headless(&cpu, &bus, max_cycles);
     } else {
-        try run_with_sdl(&cpu, &bus, &display, &joypad, allocator, if (battery and sav_path_len > 0) sav_path_buf[0..sav_path_len] else null, if (state_base_len > 0) state_base_buf[0..state_base_len] else null);
+        try run_with_sdl(&cpu, &bus, &display, &joypad, allocator, if (battery and sav_path_len > 0) sav_path_buf[0..sav_path_len] else null, if (state_base_len > 0) state_base_buf[0..state_base_len] else null, rom_title);
     }
 
     // Save battery-backed RAM on exit
@@ -327,7 +339,7 @@ fn check_memory_output(bus: *Bus) bool {
 }
 
 /// SDL mode: run with display window and input handling
-fn run_with_sdl(cpu: *Cpu, bus: *Bus, display: *Display, joypad: *Joypad, allocator: std.mem.Allocator, sav_path: ?[]const u8, state_base: ?[]const u8) !void {
+fn run_with_sdl(cpu: *Cpu, bus: *Bus, display: *Display, joypad: *Joypad, allocator: std.mem.Allocator, sav_path: ?[]const u8, state_base: ?[]const u8, rom_title: []const u8) !void {
     // Initialize SDL (video + audio + game controller)
     if (c.SDL_Init(c.SDL_INIT_VIDEO | c.SDL_INIT_AUDIO | c.SDL_INIT_GAMECONTROLLER) != 0) {
         std.log.err("SDL_Init failed: {s}", .{c.SDL_GetError()});
@@ -412,6 +424,10 @@ fn run_with_sdl(cpu: *Cpu, bus: *Bus, display: *Display, joypad: *Joypad, alloca
     var osd_buf: [160 * 144]u32 = undefined;
     var state_slot: u8 = 0; // save state slot 0-3
     var volume: u8 = 100; // volume 0-100, step 10
+    var palette_idx: u8 = 0; // DMG palette index (0-3)
+    var fps_timer = std.time.nanoTimestamp();
+    var fps_frames: u32 = 0;
+    var title_buf: [128]u8 = .{0} ** 128;
 
     // Helper to build state path for current slot
     var slot_path_buf: [520]u8 = undefined;
@@ -532,7 +548,15 @@ fn run_with_sdl(cpu: *Cpu, bus: *Bus, display: *Display, joypad: *Joypad, alloca
                             display.show_osd(vol_msg[0..5], osd_duration);
                         }
                     }
-                    // 6-9: integer scale (1-5 conflicts with slot selection idea, keep as-is)
+                    // C: cycle DMG palette (only in DMG mode)
+                    if (sym == c.SDLK_c) {
+                        if (!bus.cgb_mode) {
+                            palette_idx = (palette_idx + 1) % 4;
+                            bus.ppu.dmg_colors = ppu_mod.DMG_PALETTES[palette_idx];
+                            display.show_osd(ppu_mod.DMG_PALETTE_NAMES[palette_idx], osd_duration);
+                        }
+                    }
+                    // 1-5: integer scale
                     if (sym >= c.SDLK_1 and sym <= c.SDLK_5) {
                         const scale: c_int = sym - c.SDLK_1 + 1;
                         _ = c.SDL_SetWindowFullscreen(window, 0);
@@ -710,6 +734,22 @@ fn run_with_sdl(cpu: *Cpu, bus: *Bus, display: *Display, joypad: *Joypad, alloca
             }
         } else if (!bus.ram_dirty and frame_count >= save_interval) {
             frame_count = 0; // reset counter even if not dirty
+        }
+
+        // Update window title with ROM name and FPS (every second)
+        fps_frames += 1;
+        const now_ns = std.time.nanoTimestamp();
+        const elapsed_ns = now_ns - fps_timer;
+        if (elapsed_ns >= 1_000_000_000) {
+            const elapsed_u64: u64 = @intCast(elapsed_ns);
+            const fps = @as(u64, fps_frames) * 1_000_000_000 / elapsed_u64;
+            const written = std.fmt.bufPrint(&title_buf, "gbemu - {s} | {d} fps", .{ rom_title, fps }) catch "";
+            if (written.len > 0 and written.len < title_buf.len) {
+                title_buf[written.len] = 0;
+                c.SDL_SetWindowTitle(window, @ptrCast(&title_buf));
+            }
+            fps_frames = 0;
+            fps_timer = now_ns;
         }
     }
 }
