@@ -535,6 +535,7 @@ fn run_sdl_loop(sdl: *SdlContext, cpu: *Cpu, bus: *Bus, display: *Display, joypa
     var fast_forward = false;
     const ff_multiplier: u32 = 4;
     var paused = false;
+    var show_help = false;
     const osd_duration: u16 = 120;
     var osd_buf: [160 * 144]u32 = undefined;
     var state_slot: u8 = 0;
@@ -696,6 +697,17 @@ fn run_sdl_loop(sdl: *SdlContext, cpu: *Cpu, bus: *Bus, display: *Display, joypa
                     }
                 } else if (sym == c.SDLK_r and pressed) {
                     soft_reset(cpu, bus, display, sdl.audio_dev, osd_duration);
+                } else if (sym == c.SDLK_h and pressed) {
+                    show_help = !show_help;
+                    if (show_help) {
+                        // Pause while help is shown
+                        if (sdl.audio_dev != 0) c.SDL_PauseAudioDevice(sdl.audio_dev, 1);
+                    } else {
+                        if (sdl.audio_dev != 0 and !paused) {
+                            c.SDL_ClearQueuedAudio(sdl.audio_dev);
+                            c.SDL_PauseAudioDevice(sdl.audio_dev, 0);
+                        }
+                    }
                 }
             } else if (event.type == c.SDL_DROPFILE) {
                 const dropped_file = event.drop.file;
@@ -745,7 +757,7 @@ fn run_sdl_loop(sdl: *SdlContext, cpu: *Cpu, bus: *Bus, display: *Display, joypa
             }
         }
 
-        if (!paused) {
+        if (!paused and !show_help) {
             const frames_to_run: u32 = if (fast_forward) ff_multiplier else 1;
             var ff_i: u32 = 0;
             while (ff_i < frames_to_run) : (ff_i += 1) {
@@ -758,7 +770,16 @@ fn run_sdl_loop(sdl: *SdlContext, cpu: *Cpu, bus: *Bus, display: *Display, joypa
             }
         }
 
-        if (display.frame_ready or (paused and display.osd_frames > 0)) {
+        if (show_help) {
+            // Render help overlay
+            const front = display.front_buffer();
+            @memcpy(&osd_buf, front);
+            Display.render_help(&osd_buf);
+            _ = c.SDL_UpdateTexture(sdl.texture, null, @ptrCast(&osd_buf), 160 * @sizeOf(u32));
+            _ = c.SDL_RenderClear(sdl.renderer);
+            _ = c.SDL_RenderCopy(sdl.renderer, sdl.texture, null, null);
+            c.SDL_RenderPresent(sdl.renderer);
+        } else if (display.frame_ready or (paused and display.osd_frames > 0)) {
             const front = display.front_buffer();
             @memcpy(&osd_buf, front);
             display.render_osd(&osd_buf);
@@ -777,7 +798,7 @@ fn run_sdl_loop(sdl: *SdlContext, cpu: *Cpu, bus: *Bus, display: *Display, joypa
             c.SDL_RenderPresent(sdl.renderer);
         }
 
-        if (sdl.audio_dev != 0 and !paused) {
+        if (sdl.audio_dev != 0 and !paused and !show_help) {
             const samples = bus.apu.get_samples();
             if (samples.len > 0) {
                 if (volume == 100) {
@@ -808,7 +829,7 @@ fn run_sdl_loop(sdl: *SdlContext, cpu: *Cpu, bus: *Bus, display: *Display, joypa
             }
         }
 
-        if (paused) {
+        if (paused or show_help) {
             c.SDL_Delay(16);
         }
 

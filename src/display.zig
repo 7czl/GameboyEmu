@@ -120,6 +120,73 @@ pub const Display = struct {
             }
         }
     }
+
+    /// Render help overlay onto buffer
+    pub fn render_help(buf: []u32) void {
+        // Darken entire screen
+        for (buf, 0..) |pixel, i| {
+            const r = ((pixel >> 16) & 0xFF) / 4;
+            const g = ((pixel >> 8) & 0xFF) / 4;
+            const b = (pixel & 0xFF) / 4;
+            buf[i] = 0xFF000000 | (r << 16) | (g << 8) | b;
+        }
+
+        const help_lines = [_][]const u8{
+            "CONTROLS",
+            "",
+            "WASD    DPAD",
+            "J K     A B",
+            "ENTER   START",
+            "BKSP    SELECT",
+            "",
+            "SPACE   FAST FWD",
+            "P       PAUSE",
+            "R       RESET",
+            "C       PALETTE",
+            "1-5     SCALE",
+            "F11     FULLSCR",
+            "",
+            "F1-F4   SLOT",
+            "F5      SAVE",
+            "F8      LOAD",
+            "+-      VOLUME",
+            "",
+            "H       HELP",
+            "ESC     QUIT",
+        };
+
+        const char_w: u32 = 4;
+        const line_h: u32 = 7;
+        const start_y: u32 = 4;
+
+        for (help_lines, 0..) |line, li| {
+            const y = start_y + @as(u32, @intCast(li)) * line_h;
+            if (y + 5 >= SCREEN_HEIGHT) break;
+
+            // Center each line
+            const text_w: u32 = @as(u32, @intCast(line.len)) * char_w;
+            const x: u32 = if (text_w < SCREEN_WIDTH) (SCREEN_WIDTH - text_w) / 2 else 2;
+
+            for (line, 0..) |ch, ci| {
+                const glyph = font_glyph(ch);
+                const cx: u32 = x + @as(u32, @intCast(ci)) * char_w;
+                for (glyph, 0..) |row, ry| {
+                    var bit: u3 = 2;
+                    while (true) {
+                        if (row & (@as(u8, 1) << bit) != 0) {
+                            const px = cx + (2 - @as(u32, bit));
+                            const py = y + @as(u32, @intCast(ry));
+                            if (px < SCREEN_WIDTH and py < SCREEN_HEIGHT) {
+                                buf[py * SCREEN_WIDTH + px] = 0xFFFFFFFF;
+                            }
+                        }
+                        if (bit == 0) break;
+                        bit -= 1;
+                    }
+                }
+            }
+        }
+    }
 };
 
 // 3x5 pixel font for OSD — covers A-Z, 0-9, space, and common punctuation
