@@ -234,16 +234,16 @@ pub const Bus = struct {
                 self.joypad_select = value & 0x30;
             },
             0xFF04 => {
-                self.timer.div_counter = 0;
+                self.timer.write_div();
             },
             0xFF05 => {
-                self.timer.tima = value;
+                self.timer.write_tima(value);
             },
             0xFF06 => {
-                self.timer.tma = value;
+                self.timer.write_tma(value);
             },
             0xFF07 => {
-                self.timer.tac = value;
+                self.timer.write_tac(value);
             },
             0xFF0F => {
                 self.interrupt_flag = value & 0x1F;

@@ -153,10 +153,13 @@ pub fn save(allocator: std.mem.Allocator, cpu: *CPU, bus: *Bus) ?[]u8 {
 
     // Timer
     w.write_u16(bus.timer.div_counter);
-    w.write_u16(bus.timer.tima_counter);
     w.write_u8(bus.timer.tima);
     w.write_u8(bus.timer.tma);
     w.write_u8(bus.timer.tac);
+    w.write_bool(bus.timer.prev_and_result);
+    w.write_u8(bus.timer.overflow_cycles);
+    w.write_bool(bus.timer.overflow_cancelled);
+    w.write_bool(bus.timer.tima_just_reloaded);
 
     // PPU
     save_ppu(&w, bus.ppu);
@@ -228,10 +231,13 @@ pub fn load(data: []const u8, cpu: *CPU, bus: *Bus) bool {
 
     // Timer
     bus.timer.div_counter = r.read_u16() orelse return false;
-    bus.timer.tima_counter = r.read_u16() orelse return false;
     bus.timer.tima = r.read_u8() orelse return false;
     bus.timer.tma = r.read_u8() orelse return false;
     bus.timer.tac = r.read_u8() orelse return false;
+    bus.timer.prev_and_result = r.read_bool() orelse return false;
+    bus.timer.overflow_cycles = r.read_u8() orelse return false;
+    bus.timer.overflow_cancelled = r.read_bool() orelse return false;
+    bus.timer.tima_just_reloaded = r.read_bool() orelse return false;
 
     // PPU
     if (!load_ppu(&r, bus.ppu)) return false;
