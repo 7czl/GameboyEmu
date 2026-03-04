@@ -134,6 +134,7 @@ pub const Ppu = struct {
     sprite_fetch_ticks: u8 = 0,
     sprite_tile_lo: u8 = 0,
     sprite_tile_hi: u8 = 0,
+    drawing_penalty: u8 = 0, // startup dots before fetcher begins in Drawing mode
     dmg_colors: [4]u32 = DMG_COLORS,
     pub fn init() Ppu {
         return Ppu{};
@@ -143,19 +144,29 @@ pub const Ppu = struct {
         self.cycle_counter = 0;
         self.enabled = false;
         self.mode = .OAMScan;
-        self.stat &= 0xF8;
+        // Clear mode bits (0-1) but preserve LYC flag (bit 2) and interrupt enables (bits 3-6)
+        self.stat &= 0xFC;
         self.window_line_counter = 0;
         self.window_was_active = false;
-        self.stat_irq_line = false;
+        // Preserve stat_irq_line based on remaining active sources.
+        // When LCD is off, mode bits are 0 so only the LYC source matters.
+        // This prevents spurious interrupts when LCD turns back on with
+        // an unchanged LYC comparison result.
+        self.stat_irq_line = (self.stat & 0x40 != 0) and (self.stat & 0x04 != 0);
         self.wy_latch = false;
     }
     pub fn update_stat_irq(self: *Ppu, bus: *Bus) void {
+        self.update_stat_irq_ex(bus, false);
+    }
+    /// Evaluate STAT IRQ sources. When `vblank_oam_quirk` is true,
+    /// the OAM source (bit 5) is also checked — this models the hardware
+    /// behavior where entering VBlank momentarily asserts the mode 2 line.
+    fn update_stat_irq_ex(self: *Ppu, bus: *Bus, vblank_oam_quirk: bool) void {
         const mode_val = @intFromEnum(self.mode);
         var line = false;
         if ((self.stat & 0x08 != 0) and mode_val == 0) line = true;
-        // VBlank also triggers OAM stat source (hardware quirk)
         if ((self.stat & 0x10 != 0) and mode_val == 1) line = true;
-        if ((self.stat & 0x20 != 0) and mode_val == 2) line = true;
+        if ((self.stat & 0x20 != 0) and (mode_val == 2 or vblank_oam_quirk)) line = true;
         if ((self.stat & 0x40 != 0) and (self.stat & 0x04 != 0)) line = true;
         if (line and !self.stat_irq_line) bus.request_interrupt(.LCD_STAT);
         self.stat_irq_line = line;
@@ -224,6 +235,10 @@ pub const Ppu = struct {
         self.window_triggered = false;
         self.sprite_fetch_active = false;
         self.initial_fetch_done = false;
+        // Hardware has a ~5 dot startup penalty before the fetcher begins.
+        // This accounts for the difference between 167 and 172 dots for a
+        // blank scanline (no sprites, SCX=0, no window).
+        self.drawing_penalty = 5;
     }
     fn check_sprite_at(self: *Ppu, screen_x: u8) ?u8 {
         if (self.lcdc & 0x02 == 0) return null;
@@ -373,6 +388,11 @@ pub const Ppu = struct {
         }
     }
     fn drawing_tick(self: *Ppu, bus: *Bus) void {
+        // Startup penalty: fetcher is idle for the first few dots
+        if (self.drawing_penalty > 0) {
+            self.drawing_penalty -= 1;
+            return;
+        }
         // Sprite fetch pauses BG fetcher and pixel output
         if (self.sprite_fetch_active) {
             self.sprite_fetch_ticks += 1;
@@ -493,6 +513,9 @@ pub const Ppu = struct {
             .Drawing => {
                 self.drawing_tick(bus);
                 if (self.pixels_pushed >= 160) {
+                    if (false) { // Debug: log Drawing mode duration
+                        std.log.debug("Drawing duration: {d} dots (ly={d})", .{ self.cycle_counter - 80, self.ly });
+                    }
                     self.mode = .HBlank;
                     self.set_mode(bus);
                     bus.do_hblank_hdma();
@@ -514,10 +537,12 @@ pub const Ppu = struct {
                     self.ly += 1;
                     if (self.ly >= 144) {
                         self.mode = .VBlank;
-                        // Update mode bits and LYC flag, then evaluate IRQ once
+                        // Update mode bits and LYC flag, then evaluate IRQ once.
+                        // Use vblank_oam_quirk: entering VBlank also asserts the
+                        // mode 2 (OAM) STAT source on real hardware.
                         self.stat = (self.stat & 0xFC) | @intFromEnum(self.mode);
                         self.update_lyc_flag();
-                        self.update_stat_irq(bus);
+                        self.update_stat_irq_ex(bus, true);
                         bus.request_interrupt(.VBlank);
                         if (self.display) |disp| {
                             disp.update();

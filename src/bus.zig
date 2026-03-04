@@ -118,6 +118,11 @@ pub const Bus = struct {
         if (self.oam_dma_bus_conflict and address >= 0xFE00 and address <= 0xFE9F) {
             return 0xFF;
         }
+        // PPU blocks OAM access during mode 2 (OAM scan) and mode 3 (Drawing)
+        if (address >= 0xFE00 and address <= 0xFE9F and self.ppu.enabled) {
+            const mode = @intFromEnum(self.ppu.mode);
+            if (mode == 2 or mode == 3) return 0xFF;
+        }
         switch (address) {
             0x0000...0x00FF => if (self.boot_rom_active) return self.boot_rom[address] else return self.mbc.read_rom(self.rom, address),
             0x0100...0x7FFF => return self.mbc.read_rom(self.rom, address),
@@ -158,7 +163,7 @@ pub const Bus = struct {
             0xFF01 => return self.io_registers[0x01],
             0xFF02 => return self.io_registers[0x02] | 0x7E, // bits 1-6 unused, read as 1,
             0xFF40 => return self.ppu.lcdc,
-            0xFF41 => return self.ppu.stat | 0x80, // bit 7 unused, reads as 1,
+            0xFF41 => return self.ppu.stat | 0x80, // bit 7 unused, reads as 1
             0xFF42 => return self.ppu.scy,
             0xFF43 => return self.ppu.scx,
             0xFF44 => return self.ppu.ly,
@@ -229,6 +234,11 @@ pub const Bus = struct {
         if (self.oam_dma_bus_conflict and address >= 0xFE00 and address <= 0xFE9F) {
             return;
         }
+        // PPU blocks OAM writes during mode 2 (OAM scan) and mode 3 (Drawing)
+        if (address >= 0xFE00 and address <= 0xFE9F and self.ppu.enabled) {
+            const mode = @intFromEnum(self.ppu.mode);
+            if (mode == 2 or mode == 3) return;
+        }
         switch (address) {
             0x0000...0x7FFF => self.mbc.write_rom(address, value),
             0x8000...0x9FFF => self.vram[self.vram_bank][address - 0x8000] = value,
@@ -296,6 +306,9 @@ pub const Bus = struct {
                     // Hardware starts the PPU 4 T-cycles into the scanline,
                     // so LY increments after 452 dots instead of 456.
                     self.ppu.cycle_counter = 4;
+                    // LY is already 0 from reset. Perform LYC comparison
+                    // which may set/clear the flag and trigger STAT interrupt.
+                    self.ppu.check_lyc(self);
                 } else if (old_enabled and !new_enabled) {
                     self.ppu.reset();
                 }
@@ -312,11 +325,13 @@ pub const Bus = struct {
             },
             0xFF44 => {
                 self.ppu.ly = 0;
-                self.ppu.check_lyc(self);
+                // Only update LYC comparison if PPU is enabled
+                if (self.ppu.enabled) self.ppu.check_lyc(self);
             },
             0xFF45 => {
                 self.ppu.lyc = value;
-                self.ppu.check_lyc(self);
+                // Only update LYC comparison if PPU is enabled
+                if (self.ppu.enabled) self.ppu.check_lyc(self);
             },
             0xFF46 => {
                 self.dma_transfer(value);
@@ -435,7 +450,9 @@ pub const Bus = struct {
         }
     }
 
-    /// Read a byte for OAM DMA (bypasses bus conflict logic)
+    /// Read a byte for OAM DMA (bypasses bus conflict logic).
+    /// DMA uses the external bus, so $FE00-$FFFF maps to echo RAM,
+    /// not to OAM, IO registers, or HRAM.
     fn dma_read(self: *Bus, address: u16) u8 {
         return switch (address) {
             0x0000...0x7FFF => if (self.boot_rom_active and address <= 0xFF)
@@ -447,12 +464,8 @@ pub const Bus = struct {
             0xC000...0xCFFF => self.wram[0][address - 0xC000],
             0xD000...0xDFFF => self.wram[self.wram_bank][address - 0xD000],
             0xE000...0xEFFF => self.wram[0][address - 0xE000],
-            0xF000...0xFDFF => self.wram[self.wram_bank][address - 0xF000],
-            0xFE00...0xFE9F => self.oam[address - 0xFE00],
-            0xFEA0...0xFEFF => 0xFF,
-            0xFF00...0xFF7F => self.read_io(address),
-            0xFF80...0xFFFE => self.hram[address - 0xFF80],
-            0xFFFF => self.interrupt_enable_register,
+            // $F000-$FFFF: echo RAM maps to WRAM switchable bank
+            0xF000...0xFFFF => self.wram[self.wram_bank][address - 0xF000],
         };
     }
 
