@@ -532,16 +532,20 @@ pub const Ppu = struct {
                 }
             },
             .HBlank => {
+                // LY increments 4 dots before the scanline boundary.
+                // This is visible to the CPU before the mode transition.
+                if (self.cycle_counter == 452) {
+                    self.ly += 1;
+                    self.update_lyc_flag();
+                    self.update_stat_irq(bus);
+                }
                 if (self.cycle_counter >= 456) {
                     self.cycle_counter = 0;
-                    self.ly += 1;
                     if (self.ly >= 144) {
                         self.mode = .VBlank;
-                        // Update mode bits and LYC flag, then evaluate IRQ once.
                         // Use vblank_oam_quirk: entering VBlank also asserts the
                         // mode 2 (OAM) STAT source on real hardware.
                         self.stat = (self.stat & 0xFC) | @intFromEnum(self.mode);
-                        self.update_lyc_flag();
                         self.update_stat_irq_ex(bus, true);
                         bus.request_interrupt(.VBlank);
                         if (self.display) |disp| {
@@ -549,28 +553,30 @@ pub const Ppu = struct {
                         }
                     } else {
                         self.mode = .OAMScan;
-                        // Update mode bits and LYC flag, then evaluate IRQ once
                         self.stat = (self.stat & 0xFC) | @intFromEnum(self.mode);
-                        self.update_lyc_flag();
                         self.update_stat_irq(bus);
                     }
                 }
             },
             .VBlank => {
-                if (self.cycle_counter >= 456) {
-                    self.cycle_counter = 0;
+                // LY increments 4 dots before the scanline boundary in VBlank too.
+                if (self.cycle_counter == 452) {
                     self.ly += 1;
                     if (self.ly > 153) {
                         self.ly = 0;
                         self.window_line_counter = 0;
                         self.window_was_active = false;
                         self.wy_latch = false;
+                    }
+                    self.update_lyc_flag();
+                    self.update_stat_irq(bus);
+                }
+                if (self.cycle_counter >= 456) {
+                    self.cycle_counter = 0;
+                    if (self.ly == 0) {
+                        // Transition back to OAM scan for line 0
                         self.mode = .OAMScan;
                         self.stat = (self.stat & 0xFC) | @intFromEnum(self.mode);
-                        self.update_lyc_flag();
-                        self.update_stat_irq(bus);
-                    } else {
-                        self.update_lyc_flag();
                         self.update_stat_irq(bus);
                     }
                 }
