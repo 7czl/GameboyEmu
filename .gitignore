@@ -10,3 +10,4 @@ roms/
 *.gbc
 .kiro/
 mooneye-tests
+.Ds_store
