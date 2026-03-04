@@ -122,6 +122,11 @@ pub const CPU = struct {
         bus.timer.step(bus, @intCast(t_cycles));
         // RTC ticks at CPU clock rate (always full T-cycles, not affected by double speed)
         bus.mbc.tick_rtc(t_cycles);
+        // OAM DMA: one byte per M-cycle
+        var dma_ticks = t_cycles;
+        while (dma_ticks >= 4) : (dma_ticks -= 4) {
+            bus.tick_oam_dma();
+        }
         // PPU and APU run at normal speed
         const peripheral_cycles: u32 = if (bus.double_speed) t_cycles / 2 else t_cycles;
         if (peripheral_cycles > 0) {

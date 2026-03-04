@@ -44,6 +44,14 @@ pub const Bus = struct {
     hdma_active: bool = false, // true = HBlank DMA in progress
     // Battery-backed RAM dirty flag — set when external RAM is written
     ram_dirty: bool = false,
+    // OAM DMA state
+    oam_dma_active: bool = false,
+    oam_dma_byte: u8 = 0, // current byte being transferred (0-159)
+    oam_dma_source: u16 = 0, // source base address
+    oam_dma_restarting: bool = false, // DMA restart pending
+    oam_dma_restart_source: u16 = 0, // source for restart
+    oam_dma_delay: u8 = 0, // setup delay cycles before transfer starts
+    oam_dma_bus_conflict: bool = false, // true when OAM bus is blocked by DMA
 
     pub const Interrupt = enum(u8) {
         VBlank = 1 << 0,
@@ -106,6 +114,10 @@ pub const Bus = struct {
     }
 
     pub fn read(self: *Bus, address: u16) u8 {
+        // During OAM DMA transfer, OAM reads return $FF (bus conflict)
+        if (self.oam_dma_bus_conflict and address >= 0xFE00 and address <= 0xFE9F) {
+            return 0xFF;
+        }
         switch (address) {
             0x0000...0x00FF => if (self.boot_rom_active) return self.boot_rom[address] else return self.mbc.read_rom(self.rom, address),
             0x0100...0x7FFF => return self.mbc.read_rom(self.rom, address),
@@ -207,6 +219,10 @@ pub const Bus = struct {
     }
 
     pub fn write(self: *Bus, address: u16, value: u8) void {
+        // During OAM DMA transfer, OAM writes are blocked
+        if (self.oam_dma_bus_conflict and address >= 0xFE00 and address <= 0xFE9F) {
+            return;
+        }
         switch (address) {
             0x0000...0x7FFF => self.mbc.write_rom(address, value),
             0x8000...0x9FFF => self.vram[self.vram_bank][address - 0x8000] = value,
@@ -391,20 +407,80 @@ pub const Bus = struct {
     }
 
     fn dma_transfer(self: *Bus, source_prefix: u8) void {
+        // OAM DMA: starts transferring 1 byte per M-cycle after a 2 M-cycle delay.
+        // Timing from FF46 write:
+        //   M+0: write happens (tick after write decrements delay)
+        //   M+1: OAM still accessible (delay > 0)
+        //   M+2: DMA active, OAM reads return $FF
+        // Total: 160 M-cycles (640 T-cycles) of transfer + 2 M-cycle setup.
         const source_start_addr = @as(u16, source_prefix) << 8;
-        for (0..160) |i| {
-            const offset: u16 = @intCast(i);
-            const current_source_addr: u16 = source_start_addr +% offset;
-            const value = switch (current_source_addr) {
-                0x0000...0x7FFF => self.mbc.read_rom(self.rom, current_source_addr),
-                0x8000...0x9FFF => self.vram[self.vram_bank][current_source_addr - 0x8000],
-                0xA000...0xBFFF => self.mbc.read_ram(current_source_addr),
-                0xC000...0xCFFF => self.wram[0][current_source_addr - 0xC000],
-                0xD000...0xDFFF => self.wram[self.wram_bank][current_source_addr - 0xD000],
-                0xE000...0xFDFF => self.wram[self.wram_bank][current_source_addr - 0xE000],
-                else => 0xFF,
-            };
-            self.oam[i] = value;
+        if (self.oam_dma_active) {
+            // Restarting DMA while one is in progress.
+            // The old DMA keeps running (OAM stays blocked) until the new one
+            // actually starts after a 2 M-cycle delay from this write.
+            self.oam_dma_restarting = true;
+            self.oam_dma_restart_source = source_start_addr;
+        } else {
+            self.oam_dma_active = true;
+            self.oam_dma_source = source_start_addr;
+            self.oam_dma_byte = 0;
+            self.oam_dma_delay = 2; // 2 M-cycle setup delay before first transfer
+        }
+    }
+
+    /// Read a byte for OAM DMA (bypasses bus conflict logic)
+    fn dma_read(self: *Bus, address: u16) u8 {
+        return switch (address) {
+            0x0000...0x7FFF => if (self.boot_rom_active and address <= 0xFF)
+                self.boot_rom[address]
+            else
+                self.mbc.read_rom(self.rom, address),
+            0x8000...0x9FFF => self.vram[self.vram_bank][address - 0x8000],
+            0xA000...0xBFFF => self.mbc.read_ram(address),
+            0xC000...0xCFFF => self.wram[0][address - 0xC000],
+            0xD000...0xDFFF => self.wram[self.wram_bank][address - 0xD000],
+            0xE000...0xFDFF => self.wram[self.wram_bank][address - 0xE000],
+            else => 0xFF,
+        };
+    }
+
+    /// Tick OAM DMA by one M-cycle (4 T-cycles). Called from CPU tick.
+    pub fn tick_oam_dma(self: *Bus) void {
+        if (!self.oam_dma_active) return;
+
+        // Handle restart: previous DMA was running so bus conflict stays active.
+        // We just reset the transfer to start from the new source after a delay.
+        // Use delay=1 (not 2) because the restart handler tick itself acts as
+        // the first delay cycle — fresh DMA gets delay=2 decremented to 1 in
+        // the same write_tick, but restart consumes this tick in the handler.
+        if (self.oam_dma_restarting) {
+            self.oam_dma_restarting = false;
+            self.oam_dma_source = self.oam_dma_restart_source;
+            self.oam_dma_byte = 0;
+            self.oam_dma_delay = 1;
+            // bus_conflict stays true — old DMA was already blocking OAM
+            return;
+        }
+
+        // Setup delay before first transfer
+        if (self.oam_dma_delay > 0) {
+            self.oam_dma_delay -= 1;
+            if (self.oam_dma_delay == 0) {
+                // Delay just expired — OAM bus is now blocked
+                self.oam_dma_bus_conflict = true;
+            }
+            return;
+        }
+
+        if (self.oam_dma_byte < 160) {
+            const src_addr = self.oam_dma_source +% @as(u16, self.oam_dma_byte);
+            self.oam[self.oam_dma_byte] = self.dma_read(src_addr);
+            self.oam_dma_byte += 1;
+        }
+
+        if (self.oam_dma_byte >= 160) {
+            self.oam_dma_active = false;
+            self.oam_dma_bus_conflict = false;
         }
     }
 

@@ -153,6 +153,7 @@ pub const Ppu = struct {
         const mode_val = @intFromEnum(self.mode);
         var line = false;
         if ((self.stat & 0x08 != 0) and mode_val == 0) line = true;
+        // VBlank also triggers OAM stat source (hardware quirk)
         if ((self.stat & 0x10 != 0) and mode_val == 1) line = true;
         if ((self.stat & 0x20 != 0) and mode_val == 2) line = true;
         if ((self.stat & 0x40 != 0) and (self.stat & 0x04 != 0)) line = true;
@@ -163,12 +164,16 @@ pub const Ppu = struct {
         self.stat = (self.stat & 0xFC) | @intFromEnum(self.mode);
         self.update_stat_irq(bus);
     }
-    pub fn check_lyc(self: *Ppu, bus: *Bus) void {
+    /// Update LYC coincidence flag only (no IRQ evaluation)
+    fn update_lyc_flag(self: *Ppu) void {
         if (self.ly == self.lyc) {
             self.stat |= 0x04;
         } else {
             self.stat &= ~@as(u8, 0x04);
         }
+    }
+    pub fn check_lyc(self: *Ppu, bus: *Bus) void {
+        self.update_lyc_flag();
         self.update_stat_irq(bus);
     }
     fn palette_color(self: *const Ppu, palette: u8, color_id: u2) u32 {
@@ -507,28 +512,22 @@ pub const Ppu = struct {
                 if (self.cycle_counter >= 456) {
                     self.cycle_counter = 0;
                     self.ly += 1;
-                    // Reset IRQ line to allow new rising edge on mode transition
-                    self.stat_irq_line = false;
                     if (self.ly >= 144) {
                         self.mode = .VBlank;
-                        if (self.ly == self.lyc) {
-                            self.stat |= 0x04;
-                        } else {
-                            self.stat &= ~@as(u8, 0x04);
-                        }
-                        self.set_mode(bus);
+                        // Update mode bits and LYC flag, then evaluate IRQ once
+                        self.stat = (self.stat & 0xFC) | @intFromEnum(self.mode);
+                        self.update_lyc_flag();
+                        self.update_stat_irq(bus);
                         bus.request_interrupt(.VBlank);
                         if (self.display) |disp| {
                             disp.update();
                         }
                     } else {
                         self.mode = .OAMScan;
-                        if (self.ly == self.lyc) {
-                            self.stat |= 0x04;
-                        } else {
-                            self.stat &= ~@as(u8, 0x04);
-                        }
-                        self.set_mode(bus);
+                        // Update mode bits and LYC flag, then evaluate IRQ once
+                        self.stat = (self.stat & 0xFC) | @intFromEnum(self.mode);
+                        self.update_lyc_flag();
+                        self.update_stat_irq(bus);
                     }
                 }
             },
@@ -536,21 +535,18 @@ pub const Ppu = struct {
                 if (self.cycle_counter >= 456) {
                     self.cycle_counter = 0;
                     self.ly += 1;
-                    self.stat_irq_line = false;
                     if (self.ly > 153) {
                         self.ly = 0;
                         self.window_line_counter = 0;
                         self.window_was_active = false;
                         self.wy_latch = false;
                         self.mode = .OAMScan;
-                        if (self.ly == self.lyc) {
-                            self.stat |= 0x04;
-                        } else {
-                            self.stat &= ~@as(u8, 0x04);
-                        }
-                        self.set_mode(bus);
+                        self.stat = (self.stat & 0xFC) | @intFromEnum(self.mode);
+                        self.update_lyc_flag();
+                        self.update_stat_irq(bus);
                     } else {
-                        self.check_lyc(bus);
+                        self.update_lyc_flag();
+                        self.update_stat_irq(bus);
                     }
                 }
             },

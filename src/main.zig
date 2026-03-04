@@ -397,6 +397,9 @@ fn init_post_boot_state(cpu: *Cpu, bus: *Bus, timer: *Timer, ppu: *Ppu) void {
     ppu.obp0 = 0x00;
     ppu.obp1 = 0x00;
     ppu.enabled = true;
+    ppu.mode = .VBlank;
+    ppu.ly = 153;
+    ppu.cycle_counter = 396; // Near end of line 153, about to wrap to line 0
     bus.write(0xFF26, 0xF1);
     bus.write(0xFF10, 0x80);
     bus.write(0xFF11, 0xBF);
@@ -932,6 +935,8 @@ fn soft_reset(cpu: *Cpu, bus: *Bus, display: *Display, audio_dev: c.SDL_AudioDev
     bus.ppu.obp0 = 0x00;
     bus.ppu.obp1 = 0x00;
     bus.ppu.enabled = true;
+    bus.ppu.mode = .VBlank;
+    bus.ppu.ly = 0;
     bus.write(0xFF26, 0xF1);
     bus.write(0xFF10, 0x80);
     bus.write(0xFF11, 0xBF);
