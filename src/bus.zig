@@ -119,9 +119,26 @@ pub const Bus = struct {
             return 0xFF;
         }
         // PPU blocks OAM access during mode 2 (OAM scan) and mode 3 (Drawing)
+        // Also blocks OAM 4 dots before scanline boundary (cc >= 452 in HBlank/VBlank)
+        // when the next mode will be OAM scan — this is the "early OAM lock".
         if (address >= 0xFE00 and address <= 0xFE9F and self.ppu.enabled) {
             const mode = @intFromEnum(self.ppu.mode);
-            if (mode == 2 or mode == 3) return 0xFF;
+            if (mode == 2 or mode == 3) {
+                return 0xFF;
+            }
+            // Early OAM lock: 4 dots before scanline boundary
+            if ((mode == 0 or mode == 1) and self.ppu.cycle_counter >= 452) {
+                // In HBlank: next mode is OAM scan (if ly < 144) or VBlank
+                // In VBlank on last line: next mode is OAM scan for line 0
+                if (mode == 0 and self.ppu.ly < 144) return 0xFF;
+                if (mode == 1 and self.ppu.ly == 0) return 0xFF;
+            }
+        }
+        // PPU blocks VRAM access during mode 3 (Drawing)
+        // Also early VRAM lock: 4 dots before Drawing transition (cc >= 76 in OAM scan)
+        if (address >= 0x8000 and address <= 0x9FFF and self.ppu.enabled) {
+            if (self.ppu.mode == .Drawing) return 0xFF;
+            if (self.ppu.mode == .OAMScan and self.ppu.cycle_counter >= 76) return 0xFF;
         }
         switch (address) {
             0x0000...0x00FF => if (self.boot_rom_active) return self.boot_rom[address] else return self.mbc.read_rom(self.rom, address),
@@ -166,7 +183,9 @@ pub const Bus = struct {
             0xFF41 => return self.ppu.stat | 0x80, // bit 7 unused, reads as 1
             0xFF42 => return self.ppu.scy,
             0xFF43 => return self.ppu.scx,
-            0xFF44 => return self.ppu.ly,
+            0xFF44 => {
+                return self.ppu.ly;
+            },
             0xFF45 => return self.ppu.lyc,
             0xFF47 => return self.ppu.bgp,
             0xFF48 => return self.ppu.obp0,
@@ -235,9 +254,15 @@ pub const Bus = struct {
             return;
         }
         // PPU blocks OAM writes during mode 2 (OAM scan) and mode 3 (Drawing)
+        // Exception: OAM writes succeed in the last 4 dots of mode 2 (cc >= 76)
         if (address >= 0xFE00 and address <= 0xFE9F and self.ppu.enabled) {
             const mode = @intFromEnum(self.ppu.mode);
-            if (mode == 2 or mode == 3) return;
+            if (mode == 3) return;
+            if (mode == 2 and self.ppu.cycle_counter < 76) return;
+        }
+        // PPU blocks VRAM writes during mode 3 (Drawing)
+        if (address >= 0x8000 and address <= 0x9FFF and self.ppu.enabled) {
+            if (self.ppu.mode == .Drawing) return;
         }
         switch (address) {
             0x0000...0x7FFF => self.mbc.write_rom(address, value),
@@ -302,12 +327,18 @@ pub const Bus = struct {
                 const new_enabled = (value & 0x80) != 0;
                 if (!old_enabled and new_enabled) {
                     self.ppu.enabled = true;
-                    // LCD turn-on: first scanline is shorter than normal.
-                    // Hardware starts the PPU 4 T-cycles into the scanline,
-                    // so LY increments after 452 dots instead of 456.
-                    self.ppu.cycle_counter = 4;
-                    // LY is already 0 from reset. Perform LYC comparison
-                    // which may set/clear the flag and trigger STAT interrupt.
+                    // LCD turn-on: line 0 starts in mode 0 (HBlank) and goes
+                    // straight to mode 3 (Drawing) at dot 80, skipping mode 2.
+                    self.ppu.mode = .HBlank;
+                    self.ppu.stat = (self.ppu.stat & 0xFC) | 0; // mode 0 = HBlank
+                    self.ppu.cycle_counter = 0;
+                    self.ppu.lcd_just_enabled = true;
+                    self.ppu.ly = 0;
+                    // Check WY condition on line 0
+                    if (self.ppu.wy == 0) {
+                        self.ppu.wy_latch = true;
+                    }
+                    // Perform LYC comparison
                     self.ppu.check_lyc(self);
                 } else if (old_enabled and !new_enabled) {
                     self.ppu.reset();

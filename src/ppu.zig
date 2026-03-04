@@ -135,6 +135,7 @@ pub const Ppu = struct {
     sprite_tile_lo: u8 = 0,
     sprite_tile_hi: u8 = 0,
     drawing_penalty: u8 = 0, // startup dots before fetcher begins in Drawing mode
+    lcd_just_enabled: bool = false, // true during line 0 after LCD turn-on
     dmg_colors: [4]u32 = DMG_COLORS,
     pub fn init() Ppu {
         return Ppu{};
@@ -154,6 +155,7 @@ pub const Ppu = struct {
         // an unchanged LYC comparison result.
         self.stat_irq_line = (self.stat & 0x40 != 0) and (self.stat & 0x04 != 0);
         self.wy_latch = false;
+        self.lcd_just_enabled = false;
     }
     pub fn update_stat_irq(self: *Ppu, bus: *Bus) void {
         self.update_stat_irq_ex(bus, false);
@@ -532,11 +534,25 @@ pub const Ppu = struct {
                 }
             },
             .HBlank => {
+                // LCD just enabled: line 0 starts in mode 0 and transitions
+                // directly to mode 3 at dot 80, skipping mode 2 (OAM scan).
+                // The PPU counter starts at 4 (late by 4 T-cycles), so the
+                // mode 0→3 transition appears at dot 76 from the CPU's view.
+                if (self.lcd_just_enabled and self.cycle_counter >= 80) {
+                    self.lcd_just_enabled = false;
+                    // Perform OAM scan before entering Drawing
+                    self.oam_scan(bus);
+                    self.mode = .Drawing;
+                    self.set_mode(bus);
+                    self.start_drawing();
+                    return;
+                }
                 // LY increments 4 dots before the scanline boundary.
-                // This is visible to the CPU before the mode transition.
+                // Only clear the LYC flag here; the new comparison runs
+                // at the scanline boundary (dot 456) when the mode changes.
                 if (self.cycle_counter == 452) {
                     self.ly += 1;
-                    self.update_lyc_flag();
+                    self.stat &= ~@as(u8, 0x04); // clear LYC coincidence flag
                     self.update_stat_irq(bus);
                 }
                 if (self.cycle_counter >= 456) {
@@ -556,10 +572,13 @@ pub const Ppu = struct {
                         self.stat = (self.stat & 0xFC) | @intFromEnum(self.mode);
                         self.update_stat_irq(bus);
                     }
+                    // LYC comparison at scanline boundary
+                    self.check_lyc(bus);
                 }
             },
             .VBlank => {
                 // LY increments 4 dots before the scanline boundary in VBlank too.
+                // Only clear the LYC flag here; new comparison at dot 456.
                 if (self.cycle_counter == 452) {
                     self.ly += 1;
                     if (self.ly > 153) {
@@ -568,7 +587,7 @@ pub const Ppu = struct {
                         self.window_was_active = false;
                         self.wy_latch = false;
                     }
-                    self.update_lyc_flag();
+                    self.stat &= ~@as(u8, 0x04); // clear LYC coincidence flag
                     self.update_stat_irq(bus);
                 }
                 if (self.cycle_counter >= 456) {
@@ -579,6 +598,8 @@ pub const Ppu = struct {
                         self.stat = (self.stat & 0xFC) | @intFromEnum(self.mode);
                         self.update_stat_irq(bus);
                     }
+                    // LYC comparison at scanline boundary
+                    self.check_lyc(bus);
                 }
             },
         }
