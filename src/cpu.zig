@@ -64,22 +64,28 @@ pub const CPU = struct {
             self.tick(bus, 4); // internal delay 2
             self.interrupt_master_enable = false;
 
+            // Push PC high byte first (SP-1)
+            self.sp -%= 1;
+            bus.write(self.sp, @truncate(self.pc >> 8));
+            self.tick(bus, 4);
+
+            // After high byte push, re-evaluate which interrupt to service.
+            // The push may have written to $FFFF (IE), changing which interrupts
+            // are enabled. This is the "IE push" hardware quirk.
             const fired = bus.interrupt_flag & bus.interrupt_enable_register;
+
+            // Push PC low byte (SP-2)
+            self.sp -%= 1;
+            bus.write(self.sp, @truncate(self.pc));
+            self.tick(bus, 4);
+
+            // Determine interrupt vector based on post-push IE & IF
+            var vector: u16 = 0x0000; // default if no interrupt matches (cancelled)
             for (0..5) |i| {
                 const mask = @as(u8, 1) << @intCast(i);
                 if (fired & mask != 0) {
                     bus.interrupt_flag &= ~mask;
-                    // Push PC high byte
-                    self.sp -%= 1;
-                    bus.write(self.sp, @truncate(self.pc >> 8));
-                    self.tick(bus, 4);
-                    // Push PC low byte
-                    self.sp -%= 1;
-                    bus.write(self.sp, @truncate(self.pc));
-                    self.tick(bus, 4);
-                    // Jump to vector (internal cycle for PC set)
-                    self.tick(bus, 4);
-                    self.pc = switch (i) {
+                    vector = switch (i) {
                         0 => 0x40,
                         1 => 0x48,
                         2 => 0x50,
@@ -87,25 +93,31 @@ pub const CPU = struct {
                         4 => 0x60,
                         else => unreachable,
                     };
-                    return 20;
+                    break;
                 }
             }
+
+            // Internal cycle for PC set
+            self.tick(bus, 4);
+            self.pc = vector;
             return 20;
         }
 
         // HALT bug handling moved into execute_instruction
         self.ticked_cycles = 0;
+
+        // Handle scheduled IME enable (EI instruction) - delayed by one instruction.
+        // Applied here so the instruction after EI executes before interrupts fire.
+        if (self.ime_scheduled) {
+            self.interrupt_master_enable = true;
+            self.ime_scheduled = false;
+        }
+
         const cycles = self.execute_instruction(bus);
 
         // Tick any remaining internal M-cycles not covered by read_tick/write_tick
         if (cycles > self.ticked_cycles) {
             self.tick(bus, cycles - self.ticked_cycles);
-        }
-
-        // Handle scheduled IME enable (EI instruction) - delayed by one instruction
-        if (self.ime_scheduled) {
-            self.interrupt_master_enable = true;
-            self.ime_scheduled = false;
         }
 
         return cycles;

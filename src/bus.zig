@@ -150,13 +150,15 @@ pub const Bus = struct {
             },
             0xFF05 => return self.timer.tima,
             0xFF06 => return self.timer.tma,
-            0xFF07 => return self.timer.tac,
+            0xFF07 => return self.timer.tac | 0xF8, // bits 3-7 unused, read as 1,
             0xFF0F => return self.interrupt_flag | 0xE0,
             0xFF10...0xFF3F => return self.apu.read(address),
+            // Unmapped IO registers return $FF
+            0xFF03, 0xFF08...0xFF0E => return 0xFF,
             0xFF01 => return self.io_registers[0x01],
-            0xFF02 => return self.io_registers[0x02],
+            0xFF02 => return self.io_registers[0x02] | 0x7E, // bits 1-6 unused, read as 1,
             0xFF40 => return self.ppu.lcdc,
-            0xFF41 => return self.ppu.stat,
+            0xFF41 => return self.ppu.stat | 0x80, // bit 7 unused, reads as 1,
             0xFF42 => return self.ppu.scy,
             0xFF43 => return self.ppu.scx,
             0xFF44 => return self.ppu.ly,
@@ -210,6 +212,10 @@ pub const Bus = struct {
             },
             else => {
                 const offset = address - 0xFF00;
+                // On DMG, CGB-only registers ($FF4C-$FF7F) return $FF
+                if (!self.cgb_mode and address >= 0xFF4C and address <= 0xFF7F) {
+                    return 0xFF;
+                }
                 if (offset < self.io_registers.len) {
                     return self.io_registers[offset];
                 }
@@ -314,6 +320,7 @@ pub const Bus = struct {
             },
             0xFF46 => {
                 self.dma_transfer(value);
+                self.io_registers[0x46] = value; // Store for readback
             },
             0xFF47 => {
                 self.ppu.bgp = value;
@@ -439,8 +446,13 @@ pub const Bus = struct {
             0xA000...0xBFFF => self.mbc.read_ram(address),
             0xC000...0xCFFF => self.wram[0][address - 0xC000],
             0xD000...0xDFFF => self.wram[self.wram_bank][address - 0xD000],
-            0xE000...0xFDFF => self.wram[self.wram_bank][address - 0xE000],
-            else => 0xFF,
+            0xE000...0xEFFF => self.wram[0][address - 0xE000],
+            0xF000...0xFDFF => self.wram[self.wram_bank][address - 0xF000],
+            0xFE00...0xFE9F => self.oam[address - 0xFE00],
+            0xFEA0...0xFEFF => 0xFF,
+            0xFF00...0xFF7F => self.read_io(address),
+            0xFF80...0xFFFE => self.hram[address - 0xFF80],
+            0xFFFF => self.interrupt_enable_register,
         };
     }
 

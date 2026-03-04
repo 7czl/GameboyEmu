@@ -37,7 +37,7 @@ pub const Joypad = struct {
             if (self.start) result &= ~@as(u8, 0x08);
         }
 
-        return (select_byte & 0x30) | result;
+        return 0xC0 | (select_byte & 0x30) | result;
     }
 
     /// Set key state by scancode
