@@ -473,16 +473,28 @@ fn run_headless(cpu: *Cpu, bus: *Bus, max_cycles: u64) void {
 
     const start_ns = std.time.nanoTimestamp();
     var last_check: u64 = 0;
+    var mooneye_detected = false;
     while (max_cycles == 0 or cpu.cycles < max_cycles) {
         _ = cpu.step(bus);
 
-        if (max_cycles != 0 and cpu.cycles - last_check >= 70224) {
+        // Check for Mooneye LD B, B breakpoint
+        if (cpu.debug_breakpoint) {
+            cpu.debug_breakpoint = false;
+            if (check_mooneye_result(cpu)) {
+                mooneye_detected = true;
+                break;
+            }
+        }
+
+        if (!mooneye_detected and max_cycles != 0 and cpu.cycles - last_check >= 70224) {
             last_check = cpu.cycles;
             if (check_memory_output(bus)) break;
         }
     }
 
-    _ = check_memory_output(bus);
+    if (!mooneye_detected) {
+        _ = check_memory_output(bus);
+    }
 
     const end_ns = std.time.nanoTimestamp();
     const elapsed_ns: u64 = @intCast(end_ns - start_ns);
@@ -497,6 +509,20 @@ fn run_headless(cpu: *Cpu, bus: *Bus, max_cycles: u64) void {
         speedup / 100,
         speedup % 100,
     });
+}
+
+/// Check Mooneye test result: pass = B/C/D/E/H/L == 3/5/8/13/21/34
+fn check_mooneye_result(cpu: *Cpu) bool {
+    const stdout_file = std.fs.File.stdout();
+    if (cpu.b == 3 and cpu.c == 5 and cpu.d == 8 and cpu.e == 13 and cpu.h == 21 and cpu.l == 34) {
+        stdout_file.writeAll("\nMooneye test: PASSED\n") catch {};
+        return true;
+    } else if (cpu.b == 0x42 and cpu.c == 0x42 and cpu.d == 0x42 and cpu.e == 0x42 and cpu.h == 0x42 and cpu.l == 0x42) {
+        stdout_file.writeAll("\nMooneye test: FAILED\n") catch {};
+        stdout_file.writeAll("  B=0x42 C=0x42 D=0x42 E=0x42 H=0x42 L=0x42\n") catch {};
+        return true;
+    }
+    return false;
 }
 
 fn check_memory_output(bus: *Bus) bool {

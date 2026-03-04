@@ -16,6 +16,7 @@ pub const CPU = struct {
     halted: bool = false,
     ime_scheduled: bool = false,
     halt_bug_active: bool = false,
+    debug_breakpoint: bool = false, // set on LD B, B (0x40) for test ROM detection
     ticked_cycles: u32 = 0, // cycles ticked during current instruction
 
     const Z_FLAG: u8 = 1 << 7; // 0b10000000
@@ -39,6 +40,7 @@ pub const CPU = struct {
             .halted = false,
             .ime_scheduled = false,
             .halt_bug_active = false,
+            .debug_breakpoint = false,
             .ticked_cycles = 0,
         };
     }
@@ -794,7 +796,8 @@ pub const CPU = struct {
                 self.pc += 1;
                 return 4;
             },
-            0x40 => { // LD B, B
+            0x40 => { // LD B, B (also used as debug breakpoint)
+                self.debug_breakpoint = true;
                 self.pc += 1;
                 return 4;
             },
