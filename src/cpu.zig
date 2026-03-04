@@ -178,6 +178,7 @@ pub const CPU = struct {
                 bus.oam_bug_inc_dec(bc);
                 bc +%= 1;
                 self.set_bc(bc);
+                self.tick(bus, 4); // M2: internal cycle
                 self.pc += 1;
                 return 8;
             },
@@ -241,6 +242,7 @@ pub const CPU = struct {
                 self.set_carry_flag(res > 0xFFFF);
                 self.f |= z_flag_preserved;
                 self.set_hl(@truncate(res));
+                self.tick(bus, 4); // M2: internal cycle
                 self.pc += 1;
                 return 8;
             },
@@ -255,6 +257,7 @@ pub const CPU = struct {
                 bus.oam_bug_inc_dec(bc);
                 bc -%= 1;
                 self.set_bc(bc);
+                self.tick(bus, 4); // M2: internal cycle
                 self.pc += 1;
                 return 8;
             },
@@ -334,6 +337,7 @@ pub const CPU = struct {
                 bus.oam_bug_inc_dec(de);
                 de +%= 1;
                 self.set_de(de);
+                self.tick(bus, 4); // M2: internal cycle
                 self.pc += 1;
                 return 8;
             },
@@ -381,6 +385,7 @@ pub const CPU = struct {
                 const offset = self.read_tick(bus, self.pc + 1);
                 const next_pc = self.pc + 2;
                 self.pc = @as(u16, @bitCast(@as(i16, @bitCast(next_pc)) + @as(i8, @bitCast(offset))));
+                self.tick(bus, 4); // M3: internal cycle for PC adjustment
                 return 12;
             },
             0x19 => { // ADD HL, DE
@@ -394,6 +399,7 @@ pub const CPU = struct {
                 self.set_carry_flag(res > 0xFFFF);
                 self.f |= z_flag_preserved;
                 self.set_hl(@truncate(res));
+                self.tick(bus, 4); // M2: internal cycle
                 self.pc += 1;
                 return 8;
             },
@@ -408,6 +414,7 @@ pub const CPU = struct {
                 bus.oam_bug_inc_dec(de);
                 de -%= 1;
                 self.set_de(de);
+                self.tick(bus, 4); // M2: internal cycle
                 self.pc += 1;
                 return 8;
             },
@@ -457,6 +464,7 @@ pub const CPU = struct {
                 if (!self.get_zero_flag()) {
                     const next_pc = self.pc + 2;
                     self.pc = @as(u16, @bitCast(@as(i16, @bitCast(next_pc)) + @as(i8, @bitCast(offset))));
+                    self.tick(bus, 4); // M3: internal cycle for PC adjustment
                     return 12;
                 } else {
                     self.pc += 2;
@@ -485,6 +493,7 @@ pub const CPU = struct {
                 bus.oam_bug_inc_dec(hl_val);
                 hl_val +%= 1;
                 self.set_hl(hl_val);
+                self.tick(bus, 4); // M2: internal cycle
                 self.pc += 1;
                 return 8;
             },
@@ -560,6 +569,7 @@ pub const CPU = struct {
                 if (self.get_zero_flag()) {
                     const next_pc = self.pc + 2;
                     self.pc = @as(u16, @bitCast(@as(i16, @bitCast(next_pc)) + @as(i8, @bitCast(offset))));
+                    self.tick(bus, 4); // M3: internal cycle for PC adjustment
                     return 12;
                 } else {
                     self.pc += 2;
@@ -576,6 +586,7 @@ pub const CPU = struct {
                 self.set_carry_flag(res > 0xFFFF);
                 self.f |= z_flag_preserved;
                 self.set_hl(@truncate(res));
+                self.tick(bus, 4); // M2: internal cycle
                 self.pc += 1;
                 return 8;
             },
@@ -593,6 +604,7 @@ pub const CPU = struct {
                 bus.oam_bug_inc_dec(hl);
                 hl -%= 1;
                 self.set_hl(hl);
+                self.tick(bus, 4); // M2: internal cycle
                 self.pc += 1;
                 return 8;
             },
@@ -639,6 +651,7 @@ pub const CPU = struct {
                 if ((self.f & C_FLAG) == 0) {
                     const next_pc = self.pc + 2;
                     self.pc = @as(u16, @bitCast(@as(i16, @bitCast(next_pc)) + @as(i8, @bitCast(offset))));
+                    self.tick(bus, 4); // M3: internal cycle for PC adjustment
                     return 12;
                 } else {
                     self.pc += 2;
@@ -665,6 +678,7 @@ pub const CPU = struct {
             0x33 => { // INC SP
                 bus.oam_bug_inc_dec(self.sp);
                 self.sp +%= 1;
+                self.tick(bus, 4); // M2: internal cycle
                 self.pc += 1;
                 return 8;
             },
@@ -720,6 +734,7 @@ pub const CPU = struct {
                 if ((self.f & C_FLAG) != 0) {
                     const next_pc = self.pc + 2;
                     self.pc = @as(u16, @bitCast(@as(i16, @bitCast(next_pc)) + @as(i8, @bitCast(offset))));
+                    self.tick(bus, 4); // M3: internal cycle for PC adjustment
                     return 12;
                 } else {
                     self.pc += 2;
@@ -737,6 +752,7 @@ pub const CPU = struct {
                 self.set_half_carry_flag((hl & 0x0FFF) + (sp & 0x0FFF) > 0x0FFF);
                 self.f |= z_flag_preserved;
                 self.set_hl(@truncate(result));
+                self.tick(bus, 4); // M2: internal cycle
                 self.pc += 1;
                 return 8;
             },
@@ -752,6 +768,7 @@ pub const CPU = struct {
             0x3B => { // DEC SP
                 bus.oam_bug_inc_dec(self.sp);
                 self.sp -%= 1;
+                self.tick(bus, 4); // M2: internal cycle
                 self.pc += 1;
                 return 8;
             },
@@ -1895,12 +1912,14 @@ pub const CPU = struct {
                 return 4;
             },
             0xC0 => { // RET NZ
+                self.tick(bus, 4); // M2: internal cycle for condition check
                 if (!self.get_zero_flag()) {
                     const low = self.read_tick(bus, self.sp);
                     self.sp +%= 1;
                     const high = self.read_tick(bus, self.sp);
                     self.sp +%= 1;
                     self.pc = (@as(u16, high) << 8) | @as(u16, low);
+                    self.tick(bus, 4); // M5: internal cycle for PC set
                     return 20;
                 } else {
                     self.pc += 1;
@@ -1924,6 +1943,7 @@ pub const CPU = struct {
                 if (!self.get_zero_flag()) {
                     const addr = (@as(u16, high) << 8) | @as(u16, low);
                     self.pc = addr;
+                    self.tick(bus, 4); // M4: internal cycle for PC set
                     return 16;
                 } else {
                     self.pc += 3;
@@ -1934,6 +1954,7 @@ pub const CPU = struct {
                 const lo = self.read_tick(bus, self.pc + 1);
                 const hi = self.read_tick(bus, self.pc + 2);
                 self.pc = @as(u16, lo) | (@as(u16, hi) << 8);
+                self.tick(bus, 4); // M4: internal cycle for PC set
                 return 16;
             },
             0xC4 => { // CALL NZ, u16
@@ -1941,6 +1962,7 @@ pub const CPU = struct {
                 const hi = self.read_tick(bus, self.pc + 2);
                 if (!self.get_zero_flag()) {
                     const ret_addr = self.pc + 3;
+                    self.tick(bus, 4); // M4: internal cycle before push
                     self.sp -%= 1;
                     self.write_tick(bus, self.sp, @truncate(ret_addr >> 8));
                     self.sp -%= 1;
@@ -1985,6 +2007,7 @@ pub const CPU = struct {
                 const ret_addr = self.pc + 1;
                 const pc_hi: u8 = @truncate(ret_addr >> 8);
                 const pc_lo: u8 = @truncate(ret_addr);
+                self.tick(bus, 4); // M2: internal cycle before push
                 self.sp -%= 1;
                 self.write_tick(bus, self.sp, pc_hi);
                 self.sp -%= 1;
@@ -1993,12 +2016,14 @@ pub const CPU = struct {
                 return 16;
             },
             0xC8 => { // RET Z
+                self.tick(bus, 4); // M2: internal cycle for condition check
                 if (self.get_zero_flag()) {
                     const lo = self.read_tick(bus, self.sp);
                     self.sp +%= 1;
                     const hi = self.read_tick(bus, self.sp);
                     self.sp +%= 1;
                     self.pc = (@as(u16, hi) << 8) | @as(u16, lo);
+                    self.tick(bus, 4); // M5: internal cycle for PC set
                     return 20;
                 } else {
                     self.pc += 1;
@@ -2011,12 +2036,14 @@ pub const CPU = struct {
                 const hi = self.read_tick(bus, self.sp);
                 self.sp +%= 1;
                 self.pc = (@as(u16, hi) << 8) | @as(u16, low);
+                self.tick(bus, 4); // M4: internal cycle for PC set
                 return 16;
             },
             0xCA => { // JP Z, u16
                 const target_addr = self.read_u16(bus);
                 if (self.get_zero_flag()) {
                     self.pc = target_addr;
+                    self.tick(bus, 4); // M4: internal cycle for PC set
                     return 16;
                 } else {
                     self.pc += 3;
@@ -3838,6 +3865,7 @@ pub const CPU = struct {
                 self.pc += 3;
 
                 if (self.get_zero_flag()) {
+                    self.tick(bus, 4); // M4: internal cycle before push
                     self.sp -%= 1;
                     self.write_tick(bus, self.sp, @truncate(self.pc >> 8));
                     self.sp -%= 1;
@@ -3853,6 +3881,7 @@ pub const CPU = struct {
                 const high = self.read_tick(bus, self.pc + 2);
                 const target_addr = (@as(u16, high) << 8) | @as(u16, low);
                 const return_addr = self.pc + 3;
+                self.tick(bus, 4); // M4: internal cycle before push
                 self.sp -%= 1;
                 self.write_tick(bus, self.sp, @truncate(return_addr >> 8));
                 self.sp -%= 1;
@@ -3878,6 +3907,7 @@ pub const CPU = struct {
                 const ret_addr = self.pc + 1;
                 const pc_hi: u8 = @truncate(ret_addr >> 8);
                 const pc_lo: u8 = @truncate(ret_addr);
+                self.tick(bus, 4); // M2: internal cycle before push
                 self.sp -%= 1;
                 self.write_tick(bus, self.sp, pc_hi);
                 self.sp -%= 1;
@@ -3886,12 +3916,14 @@ pub const CPU = struct {
                 return 16;
             },
             0xD0 => { // RET NC
+                self.tick(bus, 4); // M2: internal cycle for condition check
                 if ((self.f & C_FLAG) == 0) {
                     const low = self.read_tick(bus, self.sp);
                     self.sp +%= 1;
                     const high = self.read_tick(bus, self.sp);
                     self.sp +%= 1;
                     self.pc = (@as(u16, high) << 8) | @as(u16, low);
+                    self.tick(bus, 4); // M5: internal cycle for PC set
                     return 20;
                 } else {
                     self.pc += 1;
@@ -3917,6 +3949,7 @@ pub const CPU = struct {
                 if ((self.f & C_FLAG) == 0) {
                     const addr = (@as(u16, high) << 8) | @as(u16, low);
                     self.pc = addr;
+                    self.tick(bus, 4); // M4: internal cycle for PC set
                     return 16;
                 } else {
                     self.pc += 3;
@@ -3932,6 +3965,7 @@ pub const CPU = struct {
                 const high = self.read_tick(bus, self.pc + 2);
                 if ((self.f & C_FLAG) == 0) {
                     const ret_addr = self.pc + 3;
+                    self.tick(bus, 4); // M4: internal cycle before push
                     self.sp -%= 1;
                     self.write_tick(bus, self.sp, @truncate(ret_addr >> 8));
                     self.sp -%= 1;
@@ -3971,6 +4005,7 @@ pub const CPU = struct {
                 const ret_addr = self.pc + 1;
                 const pc_hi: u8 = @truncate(ret_addr >> 8);
                 const pc_lo: u8 = @truncate(ret_addr);
+                self.tick(bus, 4); // M2: internal cycle before push
                 self.sp -%= 1;
                 self.write_tick(bus, self.sp, pc_hi);
                 self.sp -%= 1;
@@ -3979,12 +4014,14 @@ pub const CPU = struct {
                 return 16;
             },
             0xD8 => { //RET C
+                self.tick(bus, 4); // M2: internal cycle for condition check
                 if ((self.f & C_FLAG) != 0) {
                     const lo = self.read_tick(bus, self.sp);
                     self.sp +%= 1;
                     const hi = self.read_tick(bus, self.sp);
                     self.sp +%= 1;
                     self.pc = (@as(u16, hi) << 8) | @as(u16, lo);
+                    self.tick(bus, 4); // M5: internal cycle for PC set
                     return 20;
                 } else {
                     self.pc += 1;
@@ -3997,6 +4034,7 @@ pub const CPU = struct {
                 const high = self.read_tick(bus, self.sp);
                 self.sp +%= 1;
                 self.pc = (@as(u16, high) << 8) | @as(u16, low);
+                self.tick(bus, 4); // M4: internal cycle for PC set
                 self.interrupt_master_enable = true; // Enable interrupts after RETI
                 return 16;
             },
@@ -4007,6 +4045,7 @@ pub const CPU = struct {
                 if ((self.f & C_FLAG) != 0) {
                     const addr = (@as(u16, high) << 8) | @as(u16, low);
                     self.pc = addr;
+                    self.tick(bus, 4); // M4: internal cycle for PC set
                     return 16;
                 } else {
                     self.pc += 3;
@@ -4018,6 +4057,7 @@ pub const CPU = struct {
                 const high = self.read_tick(bus, self.pc + 2);
                 if ((self.f & C_FLAG) != 0) {
                     const ret_addr = self.pc + 3;
+                    self.tick(bus, 4); // M4: internal cycle before push
                     self.sp -%= 1;
                     self.write_tick(bus, self.sp, @truncate(ret_addr >> 8));
                     self.sp -%= 1;
@@ -4047,6 +4087,7 @@ pub const CPU = struct {
                 const ret_addr = self.pc + 1;
                 const pc_hi: u8 = @truncate(ret_addr >> 8);
                 const pc_lo: u8 = @truncate(ret_addr);
+                self.tick(bus, 4); // M2: internal cycle before push
                 self.sp -%= 1;
                 self.write_tick(bus, self.sp, pc_hi);
                 self.sp -%= 1;
@@ -4105,6 +4146,7 @@ pub const CPU = struct {
                 const ret_addr = self.pc + 1;
                 const pc_hi: u8 = @truncate(ret_addr >> 8);
                 const pc_lo: u8 = @truncate(ret_addr);
+                self.tick(bus, 4); // M2: internal cycle before push
                 self.sp -%= 1;
                 self.write_tick(bus, self.sp, pc_hi);
                 self.sp -%= 1;
@@ -4133,6 +4175,8 @@ pub const CPU = struct {
                 self.set_carry_flag((original_sp & 0xFF) + imm_u8 > 0xFF);
 
                 self.sp = new_sp;
+                self.tick(bus, 4); // M3: internal cycle
+                self.tick(bus, 4); // M4: internal cycle
                 self.pc += 2;
                 return 16;
             },
@@ -4164,6 +4208,7 @@ pub const CPU = struct {
                 const ret_addr = self.pc + 1;
                 const pc_hi: u8 = @truncate(ret_addr >> 8);
                 const pc_lo: u8 = @truncate(ret_addr);
+                self.tick(bus, 4); // M2: internal cycle before push
                 self.sp -%= 1;
                 self.write_tick(bus, self.sp, pc_hi);
                 self.sp -%= 1;
@@ -4228,6 +4273,7 @@ pub const CPU = struct {
                 const ret_addr = self.pc + 1;
                 const pc_hi: u8 = @truncate(ret_addr >> 8);
                 const pc_lo: u8 = @truncate(ret_addr);
+                self.tick(bus, 4); // M2: internal cycle before push
                 self.sp -%= 1;
                 self.write_tick(bus, self.sp, pc_hi);
                 self.sp -%= 1;
@@ -4244,11 +4290,13 @@ pub const CPU = struct {
                 self.f = 0;
                 self.set_half_carry_flag(((sp & 0x0F) +% (@as(u8, @bitCast(offset_u8)) & 0x0F)) > 0x0F);
                 self.set_carry_flag(((sp & 0xFF) +% (@as(u8, @bitCast(offset_u8)) & 0xFF)) > 0xFF);
+                self.tick(bus, 4); // M3: internal cycle
                 self.pc += 2;
                 return 12;
             },
             0xF9 => { // LD SP, HL
                 self.sp = self.get_hl();
+                self.tick(bus, 4); // M2: internal cycle
                 self.pc += 1;
                 return 8;
             },
@@ -4279,6 +4327,7 @@ pub const CPU = struct {
                 const ret_addr = self.pc + 1;
                 const pc_hi: u8 = @truncate(ret_addr >> 8);
                 const pc_lo: u8 = @truncate(ret_addr);
+                self.tick(bus, 4); // M2: internal cycle before push
                 self.sp -%= 1;
                 self.write_tick(bus, self.sp, pc_hi);
                 self.sp -%= 1;
