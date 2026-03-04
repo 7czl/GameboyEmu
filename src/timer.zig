@@ -126,7 +126,11 @@ pub const Timer = struct {
 
         var i: u8 = 0;
         while (i < cycles) : (i += 1) {
+            const old_div = self.div_counter;
             self.tick(bus);
+            // Serial transfer is clocked by falling edge of DIV bit 7,
+            // so it must be checked after each T-cycle increment of div_counter.
+            bus.tick_serial(old_div);
         }
     }
 };

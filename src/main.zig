@@ -389,7 +389,7 @@ fn init_post_boot_state(cpu: *Cpu, bus: *Bus, timer: *Timer, ppu: *Ppu) void {
     cpu.sp = 0xFFFE;
     cpu.pc = 0x0100;
     bus.interrupt_flag = 0xE1;
-    timer.div_counter = 0xAB00;
+    timer.div_counter = 0xABCC;
     timer.tac = 0xF8;
     ppu.lcdc = 0x91;
     ppu.stat = 0x85;

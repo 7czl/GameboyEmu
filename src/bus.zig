@@ -52,6 +52,12 @@ pub const Bus = struct {
     oam_dma_restart_source: u16 = 0, // source for restart
     oam_dma_delay: u8 = 0, // setup delay cycles before transfer starts
     oam_dma_bus_conflict: bool = false, // true when OAM bus is blocked by DMA
+    // Serial transfer state — driven by DIV bit 7 falling edges (SameBoy-style).
+    // Each falling edge toggles serial_master_clock; a shift happens every 2nd edge.
+    // 8 shifts = 16 edges × 256 T = 4096 T total, aligned to DIV reset time.
+    serial_master_clock: bool = false,
+    serial_count: u8 = 0, // bits shifted so far (0-8)
+    serial_mask: u8 = 0, // 0 = serial clock disabled, 0x80 = DMG normal speed
 
     pub const Interrupt = enum(u8) {
         VBlank = 1 << 0,
@@ -178,7 +184,11 @@ pub const Bus = struct {
             // Unmapped IO registers return $FF
             0xFF03, 0xFF08...0xFF0E => return 0xFF,
             0xFF01 => return self.io_registers[0x01],
-            0xFF02 => return self.io_registers[0x02] | 0x7E, // bits 1-6 unused, read as 1,
+            0xFF02 => {
+                // SC: bit 7 = transfer active, bit 0 = clock select, bits 1-6 unused (read as 1)
+                const sc = self.io_registers[0x02];
+                return sc | 0x7E;
+            },
             0xFF40 => return self.ppu.lcdc,
             0xFF41 => return self.ppu.stat | 0x80, // bit 7 unused, reads as 1
             0xFF42 => return self.ppu.scy,
@@ -291,7 +301,12 @@ pub const Bus = struct {
                 self.joypad_select = value & 0x30;
             },
             0xFF04 => {
+                // DIV reset may trigger serial edge if serial_mask bit was set
+                const old_div = self.timer.div_counter;
                 self.timer.write_div();
+                if (self.serial_mask != 0 and (old_div & @as(u16, self.serial_mask)) != 0) {
+                    self.serial_master_edge();
+                }
             },
             0xFF05 => {
                 self.timer.write_tima(value);
@@ -312,13 +327,24 @@ pub const Bus = struct {
                 self.io_registers[0x01] = value;
             },
             0xFF02 => {
-                if (value == 0x81) {
+                // SameBoy SC write sequence:
+                // 1. Reset serial count
+                self.serial_count = 0;
+                // 2. DMG forces bit 1 on (only CGB can use fast serial)
+                const sc_val = if (self.cgb_mode) value else value | 0x02;
+                // 3. If serial_master_clock is high, fire an edge immediately
+                if (self.serial_master_clock) {
+                    self.serial_master_edge();
+                }
+                // 4. Write SC register
+                self.io_registers[0x02] = sc_val;
+                // 5. Set serial_mask (enables DIV-driven serial clock)
+                self.serial_mask = if (self.cgb_mode and (sc_val & 0x02) != 0) 4 else 0x80;
+                // Print serial output when starting internal clock transfer
+                if (sc_val & 0x81 == 0x81) {
                     const char = self.io_registers[0x01];
                     const stdout_file = std.fs.File.stdout();
                     stdout_file.writeAll(&[_]u8{char}) catch {};
-                    self.io_registers[address - 0xFF00] = value & 0x7F;
-                } else {
-                    self.io_registers[address - 0xFF00] = value;
                 }
             },
             0xFF40 => {
@@ -537,6 +563,33 @@ pub const Bus = struct {
         if (self.oam_dma_byte >= 160) {
             self.oam_dma_active = false;
             self.oam_dma_bus_conflict = false;
+        }
+    }
+
+    /// Called on falling edge of DIV serial_mask bit.
+    /// Toggles serial_master_clock; shifts one bit every 2nd edge.
+    /// After 8 shifts, clears SC bit 7 and requests serial interrupt.
+    fn serial_master_edge(self: *Bus) void {
+        self.serial_master_clock = !self.serial_master_clock;
+        if (!self.serial_master_clock and (self.io_registers[0x02] & 0x81) == 0x81) {
+            self.serial_count += 1;
+            if (self.serial_count == 8) {
+                self.serial_count = 0;
+                self.io_registers[0x02] &= 0x7F; // clear transfer flag
+                self.request_interrupt(Interrupt.Serial);
+            }
+            // Shift SB left, fill with 1 (no link cable = $FF received)
+            self.io_registers[0x01] = (self.io_registers[0x01] << 1) | 1;
+        }
+    }
+
+    /// Tick serial transfer — called once per T-cycle from timer step.
+    /// Detects falling edge of the serial_mask bit in DIV and drives serial_master_edge.
+    pub fn tick_serial(self: *Bus, old_div: u16) void {
+        if (self.serial_mask == 0) return;
+        const mask = @as(u16, self.serial_mask);
+        if ((old_div & mask) != 0 and (self.timer.div_counter & mask) == 0) {
+            self.serial_master_edge();
         }
     }
 
