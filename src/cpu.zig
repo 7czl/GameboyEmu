@@ -145,6 +145,19 @@ pub const CPU = struct {
             bus.ppu.step(bus, @intCast(peripheral_cycles));
             bus.apu.step(peripheral_cycles, bus.timer.div_counter, bus.double_speed);
         }
+        // Joypad interrupt: fire pending interrupt after a variable delay
+        // so the timing varies with when the button was physically pressed.
+        // On real hardware, the joypad lines are sampled asynchronously,
+        // so the interrupt can fire at any point in the frame.
+        if (bus.joypad_interrupt_pending) {
+            if (bus.joypad_interrupt_delay <= t_cycles) {
+                bus.joypad_interrupt_pending = false;
+                bus.joypad_interrupt_delay = 0;
+                bus.request_interrupt(.Joypad);
+            } else {
+                bus.joypad_interrupt_delay -= @intCast(t_cycles);
+            }
+        }
     }
 
     /// CPU-facing read: read memory then tick 1 M-cycle

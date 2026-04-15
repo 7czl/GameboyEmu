@@ -212,13 +212,18 @@ pub const Ppu = struct {
         const ly_i: i16 = @intCast(self.ly);
         for (0..40) |i| {
             const base: u16 = @intCast(i * 4);
-            const sy = @as(i16, bus.oam[base]) - 16;
+            // During OAM DMA bus conflict, PPU reads from OAM get $FF
+            const b0 = if (bus.oam_dma_bus_conflict) @as(u8, 0xFF) else bus.oam[base];
+            const b1 = if (bus.oam_dma_bus_conflict) @as(u8, 0xFF) else bus.oam[base + 1];
+            const b2 = if (bus.oam_dma_bus_conflict) @as(u8, 0xFF) else bus.oam[base + 2];
+            const b3 = if (bus.oam_dma_bus_conflict) @as(u8, 0xFF) else bus.oam[base + 3];
+            const sy = @as(i16, b0) - 16;
             if (ly_i >= sy and ly_i < sy + h) {
                 self.scanline_sprites[self.sprite_count] = .{
                     .y = sy,
-                    .x = @as(i16, bus.oam[base + 1]) - 8,
-                    .tile = bus.oam[base + 2],
-                    .attrs = bus.oam[base + 3],
+                    .x = @as(i16, b1) - 8,
+                    .tile = b2,
+                    .attrs = b3,
                     .oam_index = @intCast(i),
                 };
                 self.sprite_count += 1;

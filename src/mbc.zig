@@ -185,19 +185,36 @@ const Mbc1 = struct {
     ram_enabled: bool = false,
     banking_mode: u1 = 0, // 0 = ROM mode, 1 = RAM mode
     rom_bank_count: u16,
+    multicart: bool = false, // true for multicart ROMs (1MB MBC1)
     ram: [4 * 8192]u8 = .{0} ** (4 * 8192), // 4 banks × 8KB
 
     pub fn init(rom_size: usize) Mbc1 {
         const bank_count: u16 = @intCast(@max(2, rom_size / 0x4000));
-        return Mbc1{ .rom_bank_count = bank_count };
+        // Detect multicart: MBC1 with exactly 1MB (64 banks) ROM.
+        // Real multicarts use a different wiring where the upper 2 bits
+        // select a 256KB sub-game instead of extending the bank number.
+        const is_multicart = (bank_count == 64);
+        return Mbc1{ .rom_bank_count = bank_count, .multicart = is_multicart };
+    }
+
+    /// Number of bits used for the lower ROM bank register.
+    /// Standard MBC1: 5 bits (banks 0-31 per sub-bank).
+    /// Multicart: 4 bits (banks 0-15 per sub-game).
+    fn romBankBits(self: *const Mbc1) u5 {
+        return if (self.multicart) 4 else 5;
+    }
+
+    fn romBankMask(self: *const Mbc1) u8 {
+        return if (self.multicart) 0x0F else 0x1F;
     }
 
     pub fn read_rom(self: *Mbc1, rom: []const u8, address: u16) u8 {
         switch (address) {
             0x0000...0x3FFF => {
                 if (self.banking_mode == 1) {
-                    // In RAM banking mode, bank 0 area uses upper bits
-                    const bank: u32 = (@as(u32, self.ram_bank) << 5) % self.rom_bank_count;
+                    // In mode 1, bank 0 area uses upper bits to select sub-bank
+                    const shift = self.romBankBits();
+                    const bank: u32 = (@as(u32, self.ram_bank) << shift) % self.rom_bank_count;
                     const offset = bank * 0x4000 + address;
                     if (offset < rom.len) return rom[offset];
                     return 0xFF;
@@ -205,8 +222,18 @@ const Mbc1 = struct {
                 return rom[address];
             },
             0x4000...0x7FFF => {
-                var bank: u32 = self.rom_bank;
-                bank |= @as(u32, self.ram_bank) << 5;
+                const shift = self.romBankBits();
+                const mask = self.romBankMask();
+                const low_bank: u8 = self.rom_bank & mask;
+                // In multicart mode 0, upper bits (ram_bank) don't affect $4000 area.
+                // In standard MBC1, upper bits always apply to $4000.
+                const upper: u32 = if (self.multicart and self.banking_mode == 0)
+                    0
+                else
+                    @as(u32, self.ram_bank) << shift;
+                var bank: u32 = @as(u32, low_bank) | upper;
+                // Bank 0 → 1 fix: only when the full composed bank is 0
+                if (bank == 0) bank = 1;
                 bank %= self.rom_bank_count;
                 const offset = bank * 0x4000 + (address - 0x4000);
                 if (offset < rom.len) return rom[offset];
@@ -227,21 +254,19 @@ const Mbc1 = struct {
     pub fn write_rom(self: *Mbc1, address: u16, value: u8) void {
         switch (address) {
             0x0000...0x1FFF => {
-                // RAM enable: lower nibble == 0x0A enables
                 self.ram_enabled = (value & 0x0F) == 0x0A;
             },
             0x2000...0x3FFF => {
-                // ROM bank number (lower 5 bits)
-                var bank = value & 0x1F;
-                if (bank == 0) bank = 1; // Bank 0 maps to 1
+                // ROM bank number (lower 5 bits for standard, 4 for multicart)
+                const mask = self.romBankMask();
+                var bank = value & mask;
+                if (bank == 0) bank = 1;
                 self.rom_bank = bank;
             },
             0x4000...0x5FFF => {
-                // RAM bank / upper ROM bank bits
                 self.ram_bank = value & 0x03;
             },
             0x6000...0x7FFF => {
-                // Banking mode select
                 self.banking_mode = @truncate(value & 0x01);
             },
             else => {},

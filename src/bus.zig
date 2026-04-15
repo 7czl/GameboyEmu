@@ -52,6 +52,8 @@ pub const Bus = struct {
     oam_dma_restart_source: u16 = 0, // source for restart
     oam_dma_delay: u8 = 0, // setup delay cycles before transfer starts
     oam_dma_bus_conflict: bool = false, // true when OAM bus is blocked by DMA
+    joypad_interrupt_pending: bool = false, // set by input handler, fired during tick
+    joypad_interrupt_delay: u16 = 0, // delay in T-cycles before firing joypad interrupt
     // Serial transfer state — driven by DIV bit 7 falling edges (SameBoy-style).
     // Each falling edge toggles serial_master_clock; a shift happens every 2nd edge.
     // 8 shifts = 16 edges × 256 T = 4096 T total, aligned to DIV reset time.

@@ -316,17 +316,23 @@ fn run_single_rom(sdl: *SdlContext, allocator: std.mem.Allocator, actual_rom_pat
         }
     }
 
-    // Extract ROM title for window
+    // Extract ROM title for window (0x134-0x143, but 0x143 may be CGB flag)
     var rom_title_buf: [17]u8 = undefined;
     var rom_title_len: usize = 0;
     if (rom_bytes.len > 0x143) {
+        const title_end: usize = if (rom_bytes[0x143] == 0x80 or rom_bytes[0x143] == 0xC0) 0x143 else 0x144;
         var end: usize = 0x134;
-        while (end < 0x144 and rom_bytes[end] != 0) : (end += 1) {}
+        while (end < title_end and rom_bytes[end] != 0) : (end += 1) {
+            // Skip non-printable characters
+            if (rom_bytes[end] < 0x20 or rom_bytes[end] > 0x7E) {
+                break;
+            }
+        }
         rom_title_len = end - 0x134;
         @memcpy(rom_title_buf[0..rom_title_len], rom_bytes[0x134..end]);
     }
     rom_title_buf[rom_title_len] = 0;
-    const rom_title: [:0]const u8 = rom_title_buf[0..rom_title_len :0];
+    const rom_title: [:0]const u8 = if (rom_title_len > 0) rom_title_buf[0..rom_title_len :0] else "gbemu";
 
     // Run SDL loop
     const result = try run_sdl_loop(sdl, &cpu, &bus, &display, &joypad, allocator, if (battery and sav_path_len > 0) sav_path_buf[0..sav_path_len] else null, if (state_base_len > 0) state_base_buf[0..state_base_len] else null, rom_title);
@@ -703,6 +709,14 @@ fn run_sdl_loop(sdl: *SdlContext, cpu: *Cpu, bus: *Bus, display: *Display, joypa
                 const key = sdl_to_gb_key(sym);
                 if (key) |k| {
                     joypad.set_key(k, pressed);
+                    if (pressed) {
+                        bus.joypad_interrupt_pending = true;
+                        // Use low bits of SDL timestamp to vary the delay,
+                        // simulating the asynchronous nature of real hardware
+                        // where the button press can happen at any T-cycle.
+                        const ts: u32 = event.key.timestamp;
+                        bus.joypad_interrupt_delay = @intCast(ts % 15556);
+                    }
                 } else if (sym == c.SDLK_ESCAPE) {
                     running = false;
                 } else if (sym == c.SDLK_SPACE) {
@@ -777,6 +791,11 @@ fn run_sdl_loop(sdl: *SdlContext, cpu: *Cpu, bus: *Bus, display: *Display, joypa
                 const gb_key = controller_to_gb_key(btn);
                 if (gb_key) |k| {
                     joypad.set_key(k, btn_pressed);
+                    if (btn_pressed) {
+                        bus.joypad_interrupt_pending = true;
+                        const ts: u32 = event.cbutton.timestamp;
+                        bus.joypad_interrupt_delay = @intCast(ts % 15556);
+                    }
                 } else if (btn == c.SDL_CONTROLLER_BUTTON_RIGHTSHOULDER) {
                     fast_forward = btn_pressed;
                     if (btn_pressed and sdl.audio_dev != 0) {
@@ -965,10 +984,10 @@ fn soft_reset(cpu: *Cpu, bus: *Bus, display: *Display, audio_dev: c.SDL_AudioDev
 
 fn sdl_to_gb_key(sym: i32) ?Joypad.Key {
     return switch (sym) {
-        c.SDLK_d => .right,
-        c.SDLK_a => .left,
-        c.SDLK_w => .up,
-        c.SDLK_s => .down,
+        c.SDLK_d, c.SDLK_RIGHT => .right,
+        c.SDLK_a, c.SDLK_LEFT => .left,
+        c.SDLK_w, c.SDLK_UP => .up,
+        c.SDLK_s, c.SDLK_DOWN => .down,
         c.SDLK_j => .a,
         c.SDLK_k => .b,
         c.SDLK_BACKSPACE => .select,
